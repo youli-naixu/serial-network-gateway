@@ -1,0 +1,61 @@
+menu "Serial network gateway / 串口网络网关"
+config GW_COMPILE_CHECK_ONLY
+    bool "Compile fixture: force idle before any initialization / 编译检查强制停用"
+    default n
+config GW_WIFI_ENABLE
+    bool "Enable Wi-Fi station / 启用 Wi-Fi"
+    default n
+    help
+        Off by default. No access point, provisioning or credentials in source.
+config GW_WIFI_SSID
+    string "Wi-Fi SSID (local sdkconfig only) / 仅本地配置"
+    default ""
+config GW_WIFI_PASSWORD
+    string "Wi-Fi password (local sdkconfig only) / 仅本地配置"
+    default ""
+config GW_PORT
+    int "RFC2217 TCP port / TCP 端口"
+    range 1024 65535
+    default 3333
+config GW_UART_PINS_CONFIRMED
+    bool "I verified UART wiring, isolation and voltage / 已确认接线隔离电平"
+    default n
+    help
+        Explicit opt-in. No UART driver or output GPIO is enabled without it.
+        Confirm 3.3 V logic and isolate any CH340/CH343 TX before connecting.
+        DTR/RTS are independent GPIO, not an ASR PG_EN/reset prescription.
+config GW_TX_PIN
+    int "UART1 TX GPIO (-1 disabled) / TX 引脚"
+    range -1 48
+    default -1
+config GW_RX_PIN
+    int "UART1 RX GPIO (-1 disabled) / RX 引脚"
+    range -1 48
+    default -1
+config GW_DTR_PIN
+    int "Independent DTR GPIO (-1 unavailable) / 独立 DTR"
+    range -1 48
+    default -1
+config GW_RTS_PIN
+    int "Independent RTS GPIO (-1 unavailable) / 独立 RTS"
+    range -1 48
+    default -1
+config GW_DTR_ACTIVE_LOW
+    bool "DTR asserted = low / DTR 低有效"
+    default y
+config GW_RTS_ACTIVE_LOW
+    bool "RTS asserted = low / RTS 低有效"
+    default y
+config GW_INITIAL_BAUD
+    int "Initial baud (generic, not ASR verified) / 初始通用波特率"
+    range 300 2000000
+    default 115200
+config GW_IO_DEADLINE_MS
+    int "Per-block UART/socket write deadline / 每块发送时限 ms"
+    range 100 5000
+    default 1000
+config GW_QUEUE_BLOCKS
+    int "Blocks per direction, 256 bytes payload / 每方向队列块数"
+    range 8 128
+    default 32
+endmenu

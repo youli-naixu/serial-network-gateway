@@ -1,0 +1,14 @@
+.cache/
+.pio/
+.pio-core/
+.venv/
+build*/
+artifacts/
+sdkconfig
+sdkconfig.*
+!sdkconfig.defaults
+!sdkconfig.defaults.*
+local.defaults
+managed_components/
+dependencies.lock
+__pycache__/

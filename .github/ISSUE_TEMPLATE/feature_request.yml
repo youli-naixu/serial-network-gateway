@@ -1,0 +1,14 @@
+name: Feature request / 功能建议
+description: Describe a concrete use case / 描述具体使用场景
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case / 使用场景
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Proposed behavior and compatibility / 建议行为与兼容要求
+      description: Identify affected protocol, platform or hardware without including secrets. / 说明协议、平台或硬件范围，不包含秘密。

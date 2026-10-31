@@ -1,0 +1,26 @@
+Serial Network Gateway
+Copyright 2026 Serial Network Gateway contributors
+
+Original project code and documentation are licensed under Apache License 2.0.
+
+This project includes a modified copy of igrr/rfc2217-server:
+  https://github.com/igrr/rfc2217-server
+  Upstream commit: 281e424d4bca6c85fb8e4d727dd1fa0c315b95f1
+  License: Apache-2.0
+  Original license: firmware/components/rfc2217_server/LICENSE.txt
+  Modification record: firmware/THIRD_PARTY.md
+The original copyright and SPDX notices are preserved in the component files.
+
+Runtime dependency pySerial is licensed under BSD-3-Clause:
+  https://github.com/pyserial/pyserial
+ESP-IDF, PlatformIO, Python and Tcl/Tk retain their own licenses.
+PyInstaller is a build tool with its own license and distribution exception.
+
+HW VSP3, com0com and hub4com are independent external products, not bundled
+with this repository. Their licenses and installation requirements apply
+separately. Mentioning them does not imply endorsement or certified compatibility.
+
+本项目自行编写的代码和文档采用 Apache-2.0。
+固件复用了并修改 igrr/rfc2217-server，原许可证与署名保留，修改记录见 firmware/THIRD_PARTY.md。
+pySerial、ESP-IDF、PlatformIO、Python/Tk、PyInstaller遵守各自许可证。
+虚拟COM产品单独获取，本仓库不捆绑其驱动或安装包，不宣称厂商认证。

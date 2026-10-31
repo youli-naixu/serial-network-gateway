@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serial-network-gateway"
+version = "0.2.0a1"
+description = "Reusable TCP/RFC2217 serial gateway with bilingual desktop tools and ESP32 firmware"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+keywords = ["serial", "rfc2217", "esp32", "virtual-com", "tcp"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: System :: Hardware :: Universal Serial Bus (USB) :: Serial",
+]
+requires-python = ">=3.11"
+dependencies = ["pyserial==3.5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pyinstaller==6.20.0"]
+
+[project.scripts]
+serial-gateway = "serial_gateway.cli:main"
+
+[project.gui-scripts]
+serial-gateway-gui = "serial_gateway.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["serial_gateway*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"

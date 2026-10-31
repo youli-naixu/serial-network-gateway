@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "selected": "本机模拟测试",
+  "profiles": [
+    {
+      "name": "本机模拟测试",
+      "mode": "simulator",
+      "protocol": "rfc2217",
+      "listen_host": "127.0.0.1",
+      "listen_port": 7000,
+      "remote_host": "",
+      "remote_port": 2217,
+      "nodelay": true,
+      "buffer_bytes": 4096,
+      "chunk_bytes": 1024,
+      "connect_timeout_s": 5.0,
+      "stall_timeout_s": 10.0,
+      "keepalive_s": 10,
+      "notes": "纯软件回环；不会连接任何物理COM或真实设备。"
+    },
+    {
+      "name": "远端网关模板",
+      "mode": "device",
+      "protocol": "rfc2217",
+      "listen_host": "127.0.0.1",
+      "listen_port": 7000,
+      "remote_host": "192.0.2.10",
+      "remote_port": 2217,
+      "nodelay": true,
+      "buffer_bytes": 4096,
+      "chunk_bytes": 1024,
+      "connect_timeout_s": 5.0,
+      "stall_timeout_s": 10.0,
+      "keepalive_s": 10,
+      "notes": "文档示例地址，使用前替换。远端必须已经实现对应协议；该模板不代表ESP32已刷入网关。"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+name: Bug report / 问题报告
+description: Report reproducible behavior with sanitized evidence / 附脱敏证据报告问题
+title: '[Bug] '
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and expected behavior / 问题与预期
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      description: State raw or RFC2217 mode and simulation or hardware scope. Do not paste secrets or firmware payloads. / 说明协议与模拟或实物范围，不贴凭据或固件载荷。
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions / 版本
+      description: Project, OS, Python, driver and board versions; omit personal identifiers. / 项目、系统、Python、驱动和板卡版本，省略个人标识。
+  - type: checkboxes
+    id: sanitized
+    attributes:
+      label: Privacy / 隐私
+      options:
+        - label: I removed credentials, private addresses and device identifiers. / 已移除凭据、私有地址和设备标识。
+          required: true
