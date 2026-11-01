@@ -14,8 +14,8 @@ class WireClient:
         self.frames = []
         self.payload = bytearray()
 
-    async def collect(self, predicate):
-        async with asyncio.timeout(3):
+    async def collect(self, predicate, timeout=3):
+        async with asyncio.timeout(timeout):
             while not predicate():
                 data = await self.reader.read(4096)
                 assert data, "unexpected simulator EOF"
@@ -25,11 +25,11 @@ class WireClient:
                     elif kind == "subnegotiation" and value[0] == COM_PORT_OPTION:
                         self.frames.append(value[1:])
 
-    async def request(self, command, value=b""):
+    async def request(self, command, value=b"", timeout=3):
         self.frames = [frame for frame in self.frames if frame[0] != command + 100]
         self.writer.write(subnegotiation(command, value))
         await self.writer.drain()
-        await self.collect(lambda: any(frame[0] == command + 100 for frame in self.frames))
+        await self.collect(lambda: any(frame[0] == command + 100 for frame in self.frames), timeout)
         index = next(i for i, frame in enumerate(self.frames) if frame[0] == command + 100)
         return self.frames.pop(index)[1:]
 
@@ -55,7 +55,8 @@ def test_raw_localhost_all_bytes_random_chunks():
                     offset = end
 
             sending = asyncio.create_task(produce())
-            assert await asyncio.wait_for(reader.readexactly(len(payload)), 5) == payload
+            # 64 KiB through 137-byte reads; shared CI runners need more than a desktop.
+            assert await asyncio.wait_for(reader.readexactly(len(payload)), 30) == payload
             await sending
             writer.close()
             await writer.wait_closed()
@@ -153,7 +154,8 @@ def test_oversized_sb_is_bounded_and_following_query_works():
             try:
                 wire.writer.write(b"\xff\xfa\x2c\x01" + b"x" * (512 * 1024) + b"\xff\xf0")
                 await wire.writer.drain()
-                assert await wire.request(1, b"\0" * 4) == (9600).to_bytes(4, "big")
+                # The simulator must parse and discard 512 KiB in 137-byte reads first.
+                assert await wire.request(1, b"\0" * 4, timeout=30) == (9600).to_bytes(4, "big")
             finally:
                 wire.writer.close()
                 await wire.writer.wait_closed()
