@@ -188,7 +188,10 @@ def test_pyserial_direct_simulator_and_rejected_unsupported_control():
     serial = pytest.importorskip("serial")
 
     async def exercise():
-        async with Simulator() as simulator:
+        # pySerial's modem-line properties rely on unsolicited NOTIFY-MODEMSTATE,
+        # so this test uses the chatty mode. The default quiet mode targets
+        # drivers that mistake unsolicited Telnet bytes for serial data.
+        async with Simulator(quiet=False) as simulator:
             def client_work():
                 with serial.serial_for_url(f"rfc2217://127.0.0.1:{simulator.bound_port}?timeout=2", timeout=3) as client:
                     client.baudrate = 921600

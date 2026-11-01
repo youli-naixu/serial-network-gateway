@@ -2,18 +2,21 @@
 
 [English](verification.md) | [简体中文](verification.zh-CN.md)
 
-Snapshot of `0.2.0-alpha.1` local work. Each row lists the evidence actually collected. Missing evidence remains pending.
+Snapshot of `0.3.0-alpha` on Windows 11 23H2 x64, Python 3.14. Each row lists evidence actually collected; anything without evidence stays pending.
 
-| Area | Status | Evidence / boundary |
+| Area | Status | Evidence |
 | --- | --- | --- |
-| Python tests | Passed locally | `135 passed` on Windows/Python 3.14; ResourceWarning as error. Includes profiles, RFC2217 parsing, simulator, gateway lifecycle, i18n and virtual COM safety checks. |
-| PC simulator | Passed locally | Chinese and English self-tests; full `00..FF` 64 KiB loopback, dynamic serial settings, no stale data after reconnect. |
-| Firmware build | Passed locally | ESP32-S3, ESP-IDF 5.4.0. Default safe image and compile-check image built. The compile-check image cannot run hardware I/O. |
-| Virtual COM driver | Pending | HW VSP3 Single is installed locally, but no gateway COM was created or tested. Its default sample channel is not used. |
-| Windows COM to network | Pending | Required before claiming virtual COM support. Use the explicit `com-test --run` command against a verified virtual port. |
-| ESP32 runtime | Pending | No firmware has been flashed or connected to Wi-Fi. |
-| Electrical and target control | Pending | Pin map, logic levels, transmitter isolation, reset and boot timing are unconfirmed. |
-| ASR programming | Pending | No official programming session has been run through the gateway. |
-| GitHub release | Blocked | Local acceptance is incomplete and GitHub authentication is unavailable in the current environment. |
+| Python tests | Passed | 207 passed, 1 opt-in GUI smoke test skipped; ResourceWarning treated as error. |
+| HW VSP3 Single 3.1.2 | Passed | Channel configured by the app (one admin prompt). Real `COM10` → gateway: 64 KiB of `00..FF` round-trip identical; closing the port ends the session. |
+| HW VSP3 limits | Measured | No DTR/RTS/BREAK/PURGE. After open, only baud ≤ 57600 is forwarded; data bits/parity/stop only with a baud change. Server-initiated Telnet options appear as serial data. |
+| com0com 3.0.0.0 signed driver | Passed | Installed with a valid signature under default Windows security settings; pair created by the app. |
+| com0com bridge | Passed | `COM11` → bridge → gateway: 1.5 Mbaud and 7E2 set after open, DTR/RTS toggles and BREAK on/off all reached the gateway; 64 KiB and 16 KiB binary round-trips identical. |
+| Close detection | Passed | With `ri=ropen`, closing `COM11` ends the bridge session cleanly; a DTR pulse does not. |
+| GUI | Previewed | All six tabs rendered at 960×800 in Chinese and English; gateway + bridge started from the GUI and a COM11 client round-trip passed. |
+| ESP32 library | Compiled | Arduino-ESP32 2.0.17 (espressif32 6.10.0): both examples build, about 356 KB flash and 23 KB static RAM each. |
+| ESP-IDF firmware | Compiled | ESP-IDF 5.4.0: default and compile-check images build. |
+| ESP32 on hardware | Pending | Not flashed; no Wi-Fi or UART run yet. |
+| Electrical, reset/boot control | Pending | Pin map, logic levels, transmitter isolation and reset timing are unconfirmed. |
+| Target programming | Pending | No real flashing session through the gateway yet. |
 
-A successful TCP or RFC2217 acknowledgement only shows the exchange reached the protocol layer. It does not prove that a pin moved or that target memory was written.
+A TCP or RFC2217 acknowledgement shows the request reached the protocol layer. It does not prove that a pin moved or that target memory was written.

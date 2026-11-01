@@ -1,113 +1,60 @@
-# Windows virtual COM integration
+# Windows virtual COM
 
 [English](windows-virtual-com.md) | [简体中文](windows-virtual-com.zh-CN.md) · [README](../README.md)
 
-## Scope and current status
+A program that only knows COM ports needs a kernel driver to create one. This project ships no driver; it manages two products you install yourself. Both were tested on Windows 11 23H2 with Secure Boot, driver signature enforcement and Memory Integrity left at their defaults. Never disable those protections for this project.
 
-Serial Network Gateway exposes a loopback TCP endpoint. A serial application that requires a Windows COM device also needs an independent virtual COM driver and a redirector. Driver installation and end-to-end virtual COM acceptance for `0.2.0-alpha.1` are pending. Finding an executable or an uninstall registration does not prove that its kernel driver loads.
+## Pick a driver
 
-First complete [PC simulation](simulation.md). Use only simulated endpoints during driver acceptance; connect real hardware after the separate [hardware gate](hardware-validation.md).
-
-## Choose a route
-
-| Route | Structure | What must be verified |
+| | HW VSP3 Single 3.1.2 | com0com 3.0.0.0 signed + bridge |
 | --- | --- | --- |
-| HW VSP3 | Application → virtual COM → HW VSP3 TCP client → gateway | Exact product version, licensing, driver signature/load status, Windows compatibility, NVT behavior, serial/control forwarding. |
-| com0com + hub4com | Application → one virtual pair endpoint → paired endpoint owned by hub4com → gateway | Matching pair, exposed COM name, signed driver compatibility, hub4com filters, serial/control forwarding. |
-| Native RFC2217 client | Application → RFC2217 URL → gateway | No Windows virtual COM device is created; this only covers applications that already support the protocol. |
+| Data path | COM → driver's own TCP client → endpoint | COM ↔ hidden pair end → this app's bridge → endpoint |
+| Binary data, settings at open | yes | yes |
+| Baud change after open | 57600 and below only | yes (1.5 Mbaud tested) |
+| Data bits / parity / stop change | only together with a baud change | yes |
+| DTR / RTS / BREAK | not forwarded | forwarded |
+| PURGE | not forwarded | not forwarded |
+| End of session | when the app closes the port | when the app closes the port (close detection) |
 
-Obtain products from their official sources and review their terms. They are not redistributed with this project. Installation can require an administrator and a restart; perform it as a separate, explicit setup step. Keep Secure Boot, driver-signature enforcement, and Memory Integrity/HVCI at their normal settings. If an available driver cannot load under those settings, mark that route blocked and choose a supported product. Disabling protections is not a project prerequisite.
+Bootloaders usually toggle DTR/RTS to reset the chip and switch baud after a handshake. Choose com0com for them. HW VSP is enough for fixed-speed data.
 
-## Read-only discovery
+## HW VSP3 Single
 
-```powershell
-python -m serial_gateway environment
-python -m serial_gateway driver-help --protocol rfc2217 --port 7000
-```
+1. Download HW VSP3 **Single** from the vendor and install it. Review its licence; this project does not redistribute it.
+2. In the app, open **Virtual COM**, click *Refresh*, set the COM name (default: first free number from COM10), host `127.0.0.1`, port = the gateway's listen port, keep *RFC2217* ticked.
+3. *Preview* shows only the `CHANNEL0` section that will be written. The vendor's `[GENERAL]` section, including its password, is never copied or changed.
+4. *Apply* asks for one administrator approval. The app backs up the vendor INI, stops the service, writes the channel and restarts it. Automatic reconnect and *connect if port closed* are turned off.
 
-Discovery does not open a COM device or create a pair. Inspect Windows Device Manager and the vendor tool to establish actual driver state. Keep hardware IDs, device serial numbers, installation paths, and raw discovery output out of public reports.
+The vendor template's sample channel (`Demo`, `COM3`, `:23`) is flagged on the page because its COM name often collides with a physical adapter.
 
-## HW VSP3 setup
+HW VSP only parses replies to the RFC2217 requests it sent. Telnet option negotiation or modem notifications sent unprompted by the server are delivered to your application as data bytes. The gateway and the ESP32 library therefore default to quiet mode.
 
-1. Install an appropriate official edition under its license. Confirm the vendor's current compatibility information for the exact Windows build and security settings. Documentation for older releases is not proof of current compatibility.
-2. Start the RFC2217 simulation profile from the [simulation guide](simulation.md), using local port `7000`.
-3. In HW VSP3, choose a free virtual COM number and set the TCP destination to `127.0.0.1`, port `7000`.
-4. For RFC2217, use the vendor options **NVT Enable** and **Remote port setup**. Check the manual for the installed version; generic Telnet/NVT alone does not guarantee remote UART configuration.
-5. Create/open the virtual port and run the COM echo check below. Inspect the gateway's requested and confirmed serial settings while changing baud rate and line settings in the application.
-6. Review the redirector's connection and retry behavior. If automatic reconnect cannot be disabled, the gateway still rejects connections after a session ends until explicitly rearmed. Close the application and clear the redirector session before rearming.
+## com0com
 
-For raw TCP, disable NVT/Telnet/RFC2217 processing and use the raw simulation profile on port `7001`. A real raw endpoint must already have matching UART settings. Raw mode cannot prove remote baud-rate or control-line forwarding.
+1. Install the **signed** build `com0com-3.0.0.0-i386-and-x64-signed` from the project's SourceForge downloads. The installer's Authenticode signature should be valid (signer *CyberCircuits*).
+2. In **Virtual COM**, click *Create pair…* and pick a free name such as `COM11`. One administrator approval creates `COM11 ↔ CNCBn`, where your application uses `COM11` and the bridge opens the hidden `CNCBn`.
+3. Pairs created by the app have **close detection**: the hidden end's RI line follows "application port open" (`ri=ropen`). For a pair created elsewhere, select it and click *Enable close detection*.
+4. In **com0com bridge**, choose the pair, set the target (the ESP32, or `127.0.0.1` and the gateway port for a local test) and click *Start bridge*.
 
-## com0com and hub4com setup
+What the bridge does:
 
-Use the vendor setup utility to create a new virtual pair with a free COM name for the application. Do not rename or attach an existing physical port. The hub4com side must be an enumerated `CNCBn` endpoint with the matching `CNCAn` partner. For example, `CNCB0` is valid only if the actual pair is number `0`; it is not a universal default. Follow the upstream RFC2217 pair configuration, including baud emulation where required by that version.
+- reads the application's baud rate and line settings through the driver's in-band insertion records (extended `IOCTL_SERIAL_LSRMST_INSERT`), including changes made after the port is open;
+- sees DTR/RTS as DSR/CTS on the hidden end and BREAK as a line-status record;
+- turns each change into one RFC2217 request; sends no unsolicited Telnet negotiation;
+- answers server negotiation, so standard RFC2217 servers also work;
+- opens the hidden end at 8N1 binary. A freshly opened COM defaults to 7 data bits, and com0com masks bytes to the receiver's width, which would silently clear bit 7.
 
-The project's external adapter builds hub4com's `escparse`, `pinmap`, `linectl`, and Telnet COM-port filters. It runs an existing executable, checks the pair before opening it, restricts the target to `127.0.0.1`, and requests `--reconnect=no`. This integration still requires real driver acceptance. A plain pySerial byte bridge does not expose all Windows DCB/IOCTL changes from the other end of a virtual pair.
+Without close detection the bridge cannot tell "port closed" from "DTR pulsed", so it keeps the session open. DTR alone is never treated as a close because flashing tools pulse it on purpose.
 
-In PowerShell, provide the actual installed paths and enumerated endpoint when prompted:
+## Reconnecting
 
-```powershell
-$Setupc = Read-Host "Absolute path to installed setupc.exe"
-$Hub4com = Read-Host "Absolute path to installed hub4com.exe"
-$VirtualEndpoint = Read-Host "Enumerated virtual CNCBn endpoint"
-python -m serial_gateway com-bridge --setupc "$Setupc" --hub4com "$Hub4com" --endpoint "$VirtualEndpoint" --port 7000
-```
+After a session ends, the gateway refuses new clients until you click *Rearm*, and the bridge shows *Restart*. Close the application's COM port first. Old buffered data is never replayed into a new session.
 
-Without `--run`, this command previews arguments and does not open a port. A successful preview is not pair enumeration or driver acceptance. Start the RFC2217 simulator in another terminal, then explicitly run the bridge:
-
-```powershell
-python -m serial_gateway com-bridge --setupc "$Setupc" --hub4com "$Hub4com" --endpoint "$VirtualEndpoint" --port 7000 --run
-```
-
-Leave the bridge running while the client uses the application's COM endpoint. Stop it with Ctrl+C after the check. Closing only the application may leave hub4com's network connection alive; use a deliberate bridge stop/disconnect when testing session isolation. This adapter is for RFC2217; it is not a raw-mode adapter or a driver installer.
-
-## COM echo acceptance
-
-Use only the newly created virtual application endpoint. Confirm its identity in the vendor utility first; opening a physical serial port can change control lines. In a separate terminal, run:
+## Checks without hardware
 
 ```powershell
-$TestCom = Read-Host "Confirmed virtual application COM name"
-@'
-import sys
-import serial
-
-payload = bytes(range(256)) * 16
-with serial.Serial(sys.argv[1], baudrate=115200, timeout=5, write_timeout=5) as port:
-    port.write(payload)
-    received = bytearray()
-    while len(received) < len(payload):
-        block = port.read(len(payload) - len(received))
-        if not block:
-            raise TimeoutError("Incomplete virtual COM echo")
-        received.extend(block)
-    assert bytes(received) == payload, "Virtual COM payload mismatch"
-print("Virtual COM echo passed: 4096 bytes")
-'@ | python - "$TestCom"
+python -m serial_gateway vcom status
+python -m serial_gateway selftest
 ```
 
-This establishes binary echo for one configuration only. Complete the following acceptance cases and record each independently:
-
-| Case | Required evidence |
-| --- | --- |
-| Driver load and enumeration | Driver version, publisher/signature state, Windows build, normal security settings, and successful COM enumeration/open. |
-| Binary integrity | Exact echo equality, including `0x00`, `0xFF`, `0x11`, and `0x13`, with no implicit text conversion. |
-| Serial configuration | Change baud, data bits, parity, and stop bits; compare application requests and simulator replies. Repeat for the target's required settings. |
-| Control signals | Change DTR, RTS, and BREAK separately; check which requests reach the simulator. Report unsupported or remapped signals. |
-| One-session behavior | Reject a second gateway client; deliberately terminate the redirector connection; ensure the gateway requires rearm. |
-| Fresh session | Close application and redirector, rearm/restart, reconnect, and exchange a different marker without old bytes. |
-| Target application | Confirm the actual serial application can enumerate/open the COM port; programming acceptance requires real hardware separately. |
-
-A driver may buffer data, emulate baud rate, remap handshake signals, or hold a socket open after COM close. Observe these behaviors instead of assuming that COM close is identical to network disconnect. Recheck line-control behavior on physical pins before relying on it for reset or boot entry.
-
-## Evidence and recovery
-
-Record sanitized product/version information and per-case results in the [verification matrix](verification.md). Do not publish a compatibility badge based only on an installed program or a successful preview.
-
-If a session fails, stop the application, stop the redirector, and end the gateway session. Resolve the reported error, then start a fresh session. Do not replay a partially transmitted programming stream. Use the vendor's normal uninstall/remove-pair procedure for cleanup; the gateway does not manage kernel-driver removal.
-
-## Official references
-
-- [HW group: HW VSP3](https://www.hw-group.com/software/hw-vsp3-virtual-serial-port) — obtain the current product and its manual; availability and supported Windows versions can change.
-- [com0com project](https://com0com.sourceforge.net/) — virtual serial pairs and related utilities.
-- [hub4com README](https://com0com.sourceforge.net/hub4com/ReadMe.txt) — upstream RFC2217 client/pair examples.
-- [pySerial RFC2217 documentation](https://pyserial.readthedocs.io/en/latest/url_handlers.html#rfc2217) — direct protocol clients and limitations.
+`vcom status` is read-only: it lists drivers, pairs and warnings and never opens a COM port.

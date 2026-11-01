@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import tempfile
 import time
 import tkinter as tk
@@ -15,7 +16,11 @@ from pathlib import Path
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
 from typing import Any
 
-from ._gui_runtime import GatewayWorker, Reply, SERIAL_FIELDS, clean_text, diagnostic_document, start_auxiliary
+from ._gui_runtime import (
+    GatewayWorker, Reply, SERIAL_FIELDS, bridge_args, bridge_settings_text, build_vcom_plan, clean_text,
+    default_token_header, device_check_args, diagnostic_document, extend_diagnostics, format_device_report,
+    normalize_com, pair_label, run_background, start_auxiliary,
+)
 from .i18n import LANGUAGES, Translator, save_language
 from .locales import HELP_ZH
 from .models import GatewayProfile
@@ -41,6 +46,35 @@ _TEAL = "#087F83"
 _MUTED = "#607286"
 _RED = "#B53E3E"
 _RESET_HELP = "先关闭官方软件的 COM，再重新就绪；网络断线不自动续传。"
+_BRIDGE_RESET_HELP = "桥接会话已结束（应用关闭了 COM，或网络断开）。点击“重新开始”开始新会话；断线不自动续传。"
+_HWVSP_LIMIT = "HW VSP 不转发 DTR/RTS，打开后无法切到高于 57600 的波特率；需要这些功能请用 com0com 桥接。"
+_EXT_TASKS = {
+    "vcom_detect": "正在检测虚拟 COM 驱动", "vcom_apply": "正在应用 HW VSP 配置",
+    "pair_create": "正在新建端口对", "pair_remove": "正在删除端口对", "pair_wire": "正在配置关闭检测",
+    "bridge_start": "正在启动桥接", "bridge_stop": "正在停止桥接", "bridge_restart": "正在重新开始桥接",
+    "bridge_shutdown": "正在停止桥接", "device_check": "正在检测设备", "device_scan": "正在扫描局域网",
+}
+_BRIDGE_STATES = {
+    "stopped": ("已停止", "#63758A"),
+    "starting": ("正在启动", "#146A91"),
+    "connecting": ("正在连接远端", "#146A91"),
+    "active": ("已连接", "#087F83"),
+    "needs_reset": ("需要重新开始", "#A45B08"),
+    "error": ("运行出错", "#B53E3E"),
+}
+_BACKEND_NOTES = {
+    "Not installed. Download HW VSP3 Single from the vendor and install it with administrator rights.": "未安装。请从厂商下载 HW VSP3 Single，并以管理员权限安装。",
+    "setupc.exe not found.": "未找到 setupc.exe（com0com 未安装）。",
+    "No port pair yet. Create one to use full control-line and baud forwarding.": "尚无端口对。新建一个即可使用完整的控制线与波特率转发。",
+    "Vendor sample channel is still configured.": "仍是厂商示例通道配置。",
+}
+_MATRIX_ZH = {
+    "binary data": "二进制数据", "settings at open": "打开时的串口设置", "baud change after open": "打开后改波特率",
+    "data bits / parity / stop change": "改数据位 / 校验 / 停止位", "DTR / RTS": "DTR / RTS", "BREAK / PURGE": "BREAK / PURGE",
+    "statistics and session lock": "统计与会话锁", "yes": "支持", "no": "不支持", "<=57600 only": "仅 ≤57600",
+    "yes (incl. 1.5M)": "支持（含 1.5M）", "only with a baud change": "仅随波特率变化", "not yet": "暂不支持",
+    "via local gateway": "经本机网关", "built in": "内置",
+}
 
 
 def _short(value: Any, limit: int = 160) -> str:
@@ -131,12 +165,25 @@ class _ScrollablePage(ttk.Frame):
         self.content.bind("<Configure>", self._layout)
 
     def _layout(self, _event: tk.Event | None = None) -> None:
+        if getattr(self, "_layout_pending", False):
+            return
+        self._layout_pending = True
+        # Coalesce: wrapped labels re-flow after a width change, so the final
+        # requested height is only known once pending geometry work settles.
+        self.after_idle(self._apply_layout)
+
+    def _apply_layout(self) -> None:
+        self._layout_pending = False
         width = max(1, self.canvas.winfo_width())
         viewport = max(1, self.canvas.winfo_height())
-        height = max(viewport, self.content.winfo_reqheight())
-        self.canvas.itemconfigure(self._window, width=width, height=height)
+        # Fix only the width; the window item then follows the content's own
+        # requested height, so the scroll region can shrink as well as grow.
+        self.canvas.itemconfigure(self._window, width=width)
+        self.update_idletasks()
+        needed = self.content.winfo_reqheight()
+        height = max(viewport, needed)
         self.canvas.configure(scrollregion=(0, 0, width, height))
-        if height > viewport:
+        if needed > viewport:
             self.scrollbar.grid()
         else:
             self.scrollbar.grid_remove()
@@ -144,7 +191,7 @@ class _ScrollablePage(ttk.Frame):
 
     def bind_navigation(self) -> None:
         def attach(widget: tk.Misc) -> None:
-            if not isinstance(widget, (tk.Text, ttk.Combobox)):
+            if not isinstance(widget, (tk.Text, ttk.Combobox, tk.Listbox, ttk.Treeview)):
                 widget.bind("<MouseWheel>", self._wheel, add="+")
                 widget.bind("<Button-4>", lambda _event: self.canvas.yview_scroll(-3, "units"), add="+")
                 widget.bind("<Button-5>", lambda _event: self.canvas.yview_scroll(3, "units"), add="+")
@@ -244,16 +291,20 @@ class _GatewayApp:
             "bytes_from_client", "bytes_to_remote", "bytes_from_remote", "bytes_to_client",
         )}
         self._buffer_vars = {key: _DisplayVar(self, "当前 0 B  /  峰值 0 B") for key in ("remote", "client")}
+        self._init_extensions()
         self._configure_style()
         self._build_window()
         self._ui_ready = True
         self._apply_profile(self._base_profile)
+        self._fill_extension_defaults()
         for variable in self.vars.values():
             variable.trace_add("write", self._form_changed)
         self._worker = GatewayWorker(self._replies)
         self.root.protocol("WM_DELETE_WINDOW", self._request_close)
         self.root.bind("<Configure>", self._on_resize, add="+")
         self.root.after(50, self._poll)
+        if os.name == "nt":  # read-only driver detection; fills the pair list for the bridge tab
+            self.root.after(400, self._refresh_vcom)
         if self._load_error:
             self.root.after_idle(self._show_initial_error)
 
@@ -321,8 +372,8 @@ class _GatewayApp:
 
     def _configure_style(self) -> None:
         self.root.title(self._t(_TITLE))
-        self.root.geometry("920x720")
-        self.root.minsize(860, 660)
+        self.root.geometry("960x800")
+        self.root.minsize(880, 680)
         self.root.configure(background=_BG)
         family = "Microsoft YaHei UI" if os.name == "nt" else "TkDefaultFont"
         if os.name != "nt":
@@ -361,6 +412,9 @@ class _GatewayApp:
         self.style.configure("TNotebook", background=_BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
         self.style.configure("TNotebook.Tab", padding=(17, 9), background="#E6ECF3")
         self.style.map("TNotebook.Tab", background=[("selected", _CARD)], foreground=[("selected", _TEAL)])
+        self.style.configure("Warn.TLabel", background=_CARD, foreground="#925308", font=(family, 9, "bold"))
+        self.style.configure("Treeview", background=_CARD, fieldbackground=_CARD, foreground=_NAVY, rowheight=24, font=(family, 9))
+        self.style.configure("Treeview.Heading", background="#E6ECF3", foreground=_NAVY, font=(family, 9, "bold"))
         self.style.configure("Horizontal.TProgressbar", background=_TEAL, troughcolor="#E7EEF3", borderwidth=0, thickness=5)
 
     def _wrap(self, label: ttk.Label, inset: int = 92) -> ttk.Label:
@@ -391,22 +445,21 @@ class _GatewayApp:
         header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text=self._t(_TITLE), style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        self._wrap(ttk.Label(header, text=self._t("配置连接 · 查看运行状态 · 接入虚拟串口"), style="Muted.TLabel"), 280).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 0))
-        ttk.Button(header, text=self._t("使用说明"), command=self._open_help).grid(row=0, column=1, padx=(8, 0))
-        self._diagnostic_button = ttk.Button(header, text=self._t("导出诊断"), command=self._export_diagnostics)
-        self._diagnostic_button.grid(row=0, column=2, padx=(8, 0))
-
+        self._wrap(ttk.Label(header, text=self._t("配置连接 · 查看运行状态 · 接入虚拟串口"), style="Muted.TLabel"), 420).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        ttk.Label(header, text=self._t("语言"), style="Muted.TLabel").grid(row=0, column=1, sticky="e", padx=(8, 4))
         language_box = ttk.Combobox(header, textvariable=self._language_var,
-                                    values=tuple(LANGUAGES.values()), state="readonly", width=11)
-        language_box.grid(row=2, column=2, sticky="e", pady=(6, 0))
-        ttk.Label(header, text=self._t("语言"), style="Muted.TLabel").grid(row=2, column=1, sticky="e", pady=(6, 0))
+                                    values=tuple(LANGUAGES.values()), state="readonly", width=10)
+        language_box.grid(row=0, column=2, sticky="e")
         language_box.bind("<<ComboboxSelected>>", self._change_language)
+        ttk.Button(header, text=self._t("使用说明"), command=self._open_help).grid(row=0, column=3, padx=(8, 0))
+        self._diagnostic_button = ttk.Button(header, text=self._t("导出诊断"), command=self._export_diagnostics)
+        self._diagnostic_button.grid(row=0, column=4, padx=(8, 0))
 
         profiles = ttk.Frame(outer)
         profiles.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         profiles.columnconfigure(1, weight=1)
         ttk.Label(profiles, text=self._t("配置档")).grid(row=0, column=0, padx=(0, 10))
-        self._profile_combo = ttk.Combobox(profiles, textvariable=self._selected_var, state="readonly", width=23)
+        self._profile_combo = ttk.Combobox(profiles, textvariable=self._selected_var, state="readonly", width=28)
         self._profile_combo.grid(row=0, column=1, sticky="ew")
         self._profile_combo.bind("<<ComboboxSelected>>", self._switch_profile)
         for column, text, command in (
@@ -431,13 +484,16 @@ class _GatewayApp:
 
         self._notebook = ttk.Notebook(outer)
         self._notebook.grid(row=3, column=0, sticky="nsew")
-        pages = [_ScrollablePage(self._notebook) for _ in range(4)]
-        self._basic_tab, self._stats_tab, self._vcom_tab, self._advanced_tab = [page.content for page in pages]
-        for page, label in zip(pages, ("基本配置", "连接与统计", "虚拟 COM 接入", "高级参数")):
+        pages = [_ScrollablePage(self._notebook) for _ in range(6)]
+        (self._basic_tab, self._stats_tab, self._vcom_tab, self._bridge_tab,
+         self._device_tab, self._advanced_tab) = [page.content for page in pages]
+        for page, label in zip(pages, ("基本配置", "连接与统计", "虚拟 COM", "com0com 桥接", "ESP32 设备", "高级参数")):
             self._notebook.add(page, text=self._t(label))
         self._build_basic()
         self._build_statistics()
         self._build_virtual_com()
+        self._build_bridge()
+        self._build_device()
         self._build_advanced()
         for page in pages:
             page.bind_navigation()
@@ -560,29 +616,661 @@ class _GatewayApp:
         self._log_text.tag_configure("WARNING", foreground="#925308")
         self._log_text.tag_configure("INFO", foreground=_MUTED)
 
+    # ------------------------------------------------------------ extension state
+    def _init_extensions(self) -> None:
+        """State for the 虚拟 COM / 桥接 / ESP32 tabs; survives language rebuilds."""
+        root = self.root
+        self._ext_pending: set[str] = set()
+        self._vcom_raw: list[dict[str, Any]] | None = None
+        self._vcom_matrix: list[dict[str, str]] = []
+        self._vcom_suggest = ""
+        self._pairs: list[dict[str, Any]] = []
+        self._preview_text = ""
+        self._bridge: Any = None
+        self._bridge_state: str | None = None
+        self._bridge_event_key: Any = None
+        self._next_bridge_render = 0.0
+        self._device_raw: dict[str, Any] | None = None
+        self._device_error = ""
+        self._scan_hosts: list[str] = []
+        self.ext: dict[str, tk.StringVar] = {key: tk.StringVar(root) for key in (
+            "vcom_com", "vcom_host", "vcom_port", "bridge_pair", "bridge_host", "bridge_port",
+            "dev_host", "dev_port", "dev_http", "dev_path", "dev_header", "dev_baud", "scan_net",
+        )}
+        self.ext["vcom_host"].set("127.0.0.1")
+        self.ext["dev_port"].set("3333")
+        self.ext["dev_http"].set("80")
+        self.ext["dev_path"].set("/api/maintenance/status")
+        self.ext["dev_baud"].set("115200")
+        try:
+            self.ext["dev_header"].set(default_token_header())
+        except Exception:
+            self.ext["dev_header"].set("")
+        self._vcom_rfc = tk.BooleanVar(root, True)
+        self._probe_var = tk.BooleanVar(root, False)
+        # Memory only: never written to profiles, preferences, logs or diagnostics.
+        self._token_var = tk.StringVar(root)
+        self._vcom_result = _DisplayVar(self, "尚未检测虚拟 COM 驱动。")
+        self._device_status = _DisplayVar(self)
+        self._bridge_vars = {key: _DisplayVar(self, value) for key, value in (
+            ("state", "未启动"), ("message", ""), ("session", "—"), ("app_to_device", "0 B"),
+            ("device_to_app", "0 B"), ("settings", "等待应用设置"), ("lines", "—"), ("error", ""),
+        )}
+
+    def _listen_port_default(self) -> str:
+        port = str(self.vars["listen_port"].get()).strip()
+        if self._running and self._snapshot.get("listen_port"):
+            port = str(self._snapshot.get("listen_port"))
+        return port if port not in ("", "0") else "7000"
+
+    def _fill_extension_defaults(self, force: bool = False) -> None:
+        if force or not self.ext["vcom_port"].get():
+            self.ext["vcom_port"].set(self._listen_port_default())
+        if force or not self.ext["bridge_host"].get():
+            self._fill_bridge_from_profile()
+
+    def _fill_bridge_from_profile(self) -> None:
+        if self._modes.get(str(self.vars["mode"].get())) == "device" and str(self.vars["remote_host"].get()).strip():
+            self.ext["bridge_host"].set(str(self.vars["remote_host"].get()).strip())
+            self.ext["bridge_port"].set(str(self.vars["remote_port"].get()).strip())
+        else:
+            self.ext["bridge_host"].set("127.0.0.1")
+            self.ext["bridge_port"].set(self._listen_port_default())
+
+    def _ext_entry(self, parent: ttk.Frame, row: int, column: int, title: str, variable: tk.Variable,
+                   width: int = 15, show: str | None = None) -> ttk.Entry:
+        holder = ttk.Frame(parent, style="Card.TFrame")
+        holder.grid(row=row, column=column, sticky="ew", padx=(0, 12), pady=(0, 8))
+        holder.columnconfigure(0, weight=1)
+        ttk.Label(holder, text=self._t(title), style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 3))
+        entry = ttk.Entry(holder, textvariable=variable, width=width, **({"show": show} if show else {}))
+        entry.grid(row=1, column=0, sticky="ew")
+        return entry
+
+    def _set_text(self, widget: tk.Text, text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("end", text)
+        widget.configure(state="disabled")
+
+    def _start_ext(self, task: str, work: Any) -> bool:
+        if self._closing or task in self._ext_pending:
+            return False
+        self._ext_pending.add(task)
+        self._sync_controls()
+        run_background(task, work, self._replies)
+        return True
+
+    # ------------------------------------------------------------ tab: 虚拟 COM
     def _build_virtual_com(self) -> None:
         tab = self._vcom_tab
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(5, weight=1)
-        self._wrap(ttk.Label(tab, text=self._t("TCP 入口不是 COM；虚拟 COM 由外部驱动创建。"), style="Heading.TLabel")).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        head = ttk.Frame(tab, style="Card.TFrame")
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        head.columnconfigure(0, weight=1)
+        ttk.Label(head, text=self._t("检测到的虚拟 COM 驱动"), style="Heading.TLabel").grid(row=0, column=0, sticky="w")
+        self._vcom_refresh_button = ttk.Button(head, text=self._t("刷新检测"), command=self._refresh_vcom)
+        self._vcom_refresh_button.grid(row=0, column=1, sticky="e")
+        self._drivers_text = self._readonly_text(tab, row=1, height=6)
+        self._wrap(ttk.Label(tab, text=self._t(_HWVSP_LIMIT), style="Warn.TLabel")).grid(row=2, column=0, sticky="ew", pady=(8, 6))
+        self._matrix_tree = ttk.Treeview(tab, columns=("feature", "hwvsp", "com0com"), show="headings", height=7, selectmode="none")
+        for column, title, width in (("feature", "功能", 230), ("hwvsp", "HW VSP3 Single", 190), ("com0com", "com0com 桥接", 190)):
+            self._matrix_tree.heading(column, text=self._t(title))
+            self._matrix_tree.column(column, width=width, stretch=True)
+        self._matrix_tree.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+
+        hw = ttk.Frame(tab, style="Card.TFrame")
+        hw.grid(row=4, column=0, sticky="ew", pady=(0, 4))
+        hw.columnconfigure((0, 1, 2), weight=1, uniform="hw")
+        ttk.Label(hw, text=self._t("HW VSP3 Single 通道"), style="Heading.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        self._ext_entry(hw, 1, 0, "COM 名称", self.ext["vcom_com"])
+        self._ext_entry(hw, 1, 1, "目标主机", self.ext["vcom_host"])
+        self._ext_entry(hw, 1, 2, "目标端口", self.ext["vcom_port"])
+        ttk.Checkbutton(hw, text=self._t("RFC2217（NVT 串口设置）"), variable=self._vcom_rfc).grid(row=1, column=3, sticky="sw", pady=(0, 10))
+        buttons = ttk.Frame(hw, style="Card.TFrame")
+        buttons.grid(row=2, column=0, columnspan=4, sticky="w")
+        self._vcom_preview_button = ttk.Button(buttons, text=self._t("预览配置"), command=self._preview_vcom)
+        self._vcom_preview_button.grid(row=0, column=0)
+        self._vcom_apply_button = ttk.Button(buttons, text=self._t("应用到 HW VSP（需要管理员确认）"), command=self._apply_hwvsp)
+        self._vcom_apply_button.grid(row=0, column=1, padx=(8, 0))
+        self._preview_box = self._readonly_text(tab, row=5, height=4)
+        self._preview_box.master.grid_configure(pady=(6, 10))
+
+        c0c = ttk.Frame(tab, style="Card.TFrame")
+        c0c.grid(row=6, column=0, sticky="ew", pady=(0, 6))
+        c0c.columnconfigure(0, weight=1)
+        ttk.Label(c0c, text=self._t("com0com 端口对"), style="Heading.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._pairs_tree = ttk.Treeview(c0c, columns=("pair", "com", "endpoint"), show="headings", height=3, selectmode="browse")
+        for column, title, width in (("pair", "编号", 70), ("com", "应用端 COM", 200), ("endpoint", "桥接端点", 200)):
+            self._pairs_tree.heading(column, text=self._t(title))
+            self._pairs_tree.column(column, width=width, stretch=True)
+        self._pairs_tree.grid(row=1, column=0, sticky="ew")
+        self._pairs_tree.bind("<<TreeviewSelect>>", lambda _event: self._sync_controls(), add="+")
+        pair_buttons = ttk.Frame(c0c, style="Card.TFrame")
+        pair_buttons.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self._pair_create_button = ttk.Button(pair_buttons, text=self._t("新建端口对…"), command=self._create_pair)
+        self._pair_create_button.grid(row=0, column=0)
+        self._pair_remove_button = ttk.Button(pair_buttons, text=self._t("删除端口对"), command=self._remove_pair)
+        self._pair_remove_button.grid(row=0, column=1, padx=(8, 0))
+        self._pair_wire_button = ttk.Button(pair_buttons, text=self._t("启用关闭检测"), command=self._wire_pair)
+        self._pair_wire_button.grid(row=0, column=2, padx=(8, 0))
+        self._wrap(ttk.Label(tab, textvariable=self._vcom_result, style="Card.TLabel")).grid(row=7, column=0, sticky="ew", pady=(4, 10))
+
         endpoint = ttk.Frame(tab, style="Card.TFrame")
-        endpoint.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        endpoint.grid(row=8, column=0, sticky="ew", pady=(0, 8))
         endpoint.columnconfigure(0, weight=1)
         ttk.Label(endpoint, textvariable=self._vcom_endpoint, style="Card.TLabel").grid(row=0, column=0, sticky="w")
         self._copy_endpoint_button = ttk.Button(endpoint, text=self._t("复制入口"), command=self._copy_endpoint)
         self._copy_endpoint_button.grid(row=0, column=1, sticky="e")
-        self._wrap(ttk.Label(tab, textvariable=self._vcom_steps, style="Card.TLabel")).grid(row=2, column=0, sticky="nw", pady=(0, 8))
-        self._wrap(ttk.Label(tab, text=self._t("未安装 VCOM 驱动也可使用本机模拟与自检。检查仅列出环境信息，不会打开 COM 或安装驱动。"), style="CardMuted.TLabel")).grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self._wrap(ttk.Label(tab, text=self._t("驱动由用户自行安装（厂商签名）；本程序只读取状态，修改通道或端口对时弹出一次 Windows 管理员确认。环境检查只列出信息，不会打开 COM。"), style="CardMuted.TLabel")).grid(row=9, column=0, sticky="w", pady=(0, 8))
         buttons = ttk.Frame(tab, style="Card.TFrame")
-        buttons.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        buttons.grid(row=10, column=0, sticky="ew", pady=(0, 8))
         buttons.columnconfigure(2, weight=1)
         self._environment_button = ttk.Button(buttons, text=self._t("检查本机环境"), command=lambda: self._run_check("environment"))
         self._environment_button.grid(row=0, column=0, sticky="w")
         self._selftest_button = ttk.Button(buttons, text=self._t("运行自检"), command=lambda: self._run_check("selftest"))
         self._selftest_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
         self._wrap(ttk.Label(buttons, text=self._t("自检使用独立临时本机模拟"), style="CardMuted.TLabel")).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        self._checks_text = self._readonly_text(tab, row=5, height=5)
+        self._checks_text = self._readonly_text(tab, row=11, height=5)
         self._render_checks()
+        self._render_vcom()
+
+    def _backend(self, name: str) -> dict[str, Any] | None:
+        return next((item for item in self._vcom_raw or [] if item.get("name") == name), None)
+
+    def _note_text(self, note: Any) -> str:
+        text = str(note)
+        if text in _BACKEND_NOTES:
+            return self._t(_BACKEND_NOTES[text])
+        match = re.fullmatch(r"Configured (COM\d+) collides with a physical port; choose another name\.", text)
+        if match:
+            return self._t("配置的 {com} 与物理端口冲突，请换一个名称。", com=match.group(1))
+        return _short(text, 300)
+
+    def _render_vcom(self) -> None:
+        tr = self._t
+        if self._vcom_raw is None:
+            text = tr("点击“刷新检测”读取 HW VSP3 Single 与 com0com 的安装和配置状态（只读）。")
+        else:
+            lines = []
+            for item in self._vcom_raw:
+                name = _short(item.get("name", ""), 40)
+                installed = tr("已安装") if item.get("installed") else tr("未安装")
+                if item.get("name") == "com0com":
+                    running = tr("有端口对") if item.get("running") else tr("无端口对")
+                else:
+                    running = tr("服务运行中") if item.get("running") else tr("服务未运行")
+                lines.append(f"{name}：{installed} · {running}" if tr.language != "en" else f"{name}: {installed} · {running}")
+                channel = item.get("channel") or {}
+                if item.get("name") == "HW VSP3 Single" and item.get("installed"):
+                    lines.append("  " + tr("配置的 COM：{com} · 目标：{target} · RFC2217：{nvt}",
+                                           com=_short(channel.get("COM") or "—", 20), target=_short(channel.get("IP") or "—", 60),
+                                           nvt=tr("开") if channel.get("NvtPortSetup") == "1" else tr("关")))
+                elif item.get("name") == "com0com" and channel:
+                    lines.append("  " + tr("端口对：{pairs}", pairs=", ".join(f"{_short(com or '—', 12)} ↔ {_short(end, 12)}" for end, com in channel.items())))
+                if item.get("ports"):
+                    lines.append("  " + tr("系统中的虚拟 COM：{ports}", ports=", ".join(_short(p, 12) for p in item["ports"])))
+                lines.extend("  " + tr("提醒：{note}", note=self._note_text(note)) for note in item.get("notes", []))
+            if self._vcom_suggest:
+                lines.append(tr("建议使用的空闲 COM：{com}", com=self._vcom_suggest))
+            text = "\n".join(lines)
+        self._set_text(self._drivers_text, text)
+        self._matrix_tree.delete(*self._matrix_tree.get_children())
+        from .vcom import capability_matrix
+        for row in self._vcom_matrix or capability_matrix():
+            self._matrix_tree.insert("", "end", values=tuple(tr(_MATRIX_ZH.get(row.get(key, ""), row.get(key, ""))) for key in ("feature", "hwvsp", "com0com")))
+        selected = self._selected_pair()
+        self._pairs_tree.delete(*self._pairs_tree.get_children())
+        for pair in self._pairs:
+            iid = str(pair.get("pair"))
+            self._pairs_tree.insert("", "end", iid=iid, values=(pair.get("pair"), pair.get("com") or "—", pair.get("endpoint")))
+            if selected and selected.get("pair") == pair.get("pair"):
+                self._pairs_tree.selection_set(iid)
+        self._set_text(self._preview_box, self._preview_text or tr("点击“预览配置”查看将写入 HW VSP 的 CHANNEL0 片段（不含厂商 GENERAL 段）。"))
+        self._vcom_result.refresh()
+        try:  # during a language rebuild the bridge tab is built after this one
+            self._bridge_pair_combo.configure(values=tuple(pair_label(p) for p in self._pairs))
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _selected_pair(self) -> dict[str, Any] | None:
+        tree = getattr(self, "_pairs_tree", None)
+        try:
+            selection = tree.selection() if tree is not None else ()
+        except tk.TclError:
+            return None
+        return next((p for p in self._pairs if str(p.get("pair")) in selection), None)
+
+    def _refresh_vcom(self) -> None:
+        def work() -> dict[str, Any]:
+            from . import vcom
+            backends = [backend.to_dict() for backend in vcom.detect_backends()]
+            try:
+                suggest = vcom.suggest_free_com()
+            except RuntimeError:
+                suggest = ""
+            return {"backends": backends, "suggest": suggest, "matrix": vcom.capability_matrix()}
+        if self._start_ext("vcom_detect", work):
+            self._vcom_result.set("正在检测虚拟 COM 驱动…")
+
+    def _preview_vcom(self) -> None:
+        try:
+            plan = build_vcom_plan(self.ext["vcom_com"].get(), self.ext["vcom_host"].get(), self.ext["vcom_port"].get(), self._vcom_rfc.get())
+            from .vcom import HwVspBackend
+            self._preview_text = HwVspBackend().preview(plan)
+        except ValueError as exc:
+            self._show_error("配置无法预览", exc)
+            return
+        self.ext["vcom_com"].set(plan.com)
+        self._set_text(self._preview_box, self._preview_text)
+
+    def _apply_hwvsp(self) -> None:
+        try:
+            plan = build_vcom_plan(self.ext["vcom_com"].get(), self.ext["vcom_host"].get(), self.ext["vcom_port"].get(), self._vcom_rfc.get())
+        except ValueError as exc:
+            self._show_error("配置无法应用", exc)
+            return
+        message = self._t(
+            "将把 HW VSP 通道设为 {com} → {target}（RFC2217：{nvt}）。\n\n确定后 Windows 会弹出一次管理员确认，原配置先备份；HW VSP 服务会重启，最长约 1–2 分钟。",
+            com=plan.com, target=_address(plan.host, plan.port), nvt=self._t("开") if plan.rfc2217 else self._t("关"))
+        if not self._messagebox.askokcancel(self._t("应用到 HW VSP"), message, parent=self.root):
+            return
+        from .vcom import HwVspBackend
+        self._preview_text = HwVspBackend().preview(plan)
+        self._set_text(self._preview_box, self._preview_text)
+        if self._start_ext("vcom_apply", lambda: {"com": plan.com, **HwVspBackend().apply(plan, timeout_s=120)}):
+            self._vcom_result.set("正在等待管理员确认并应用 HW VSP 配置…")
+
+    def _create_pair(self) -> None:
+        name = self._simpledialog.askstring(self._t("新建 com0com 端口对"), self._t("应用程序使用的 COM 名称（另一端是桥接用的隐藏 CNCBn）"),
+                                            initialvalue=self._vcom_suggest or "COM20", parent=self.root)
+        if name is None:
+            return
+        try:
+            com = normalize_com(name)
+        except ValueError as exc:
+            self._show_error("无法新建端口对", exc)
+            return
+        if not self._messagebox.askokcancel(self._t("新建 com0com 端口对"), self._t("新建 {com} ↔ CNCBn 端口对。\n\n确定后 Windows 会弹出一次管理员确认，最长约 2 分钟。", com=com), parent=self.root):
+            return
+        from .vcom import Com0comBackend
+        if self._start_ext("pair_create", lambda: {"com": com, **Com0comBackend().create_pair(com)}):
+            self._vcom_result.set("正在等待管理员确认并新建端口对…")
+
+    def _wire_pair(self) -> None:
+        pair = self._selected_pair()
+        if pair is None:
+            self._show_error("无法启用关闭检测", "请先在列表中选择一个端口对。")
+            return
+        if pair.get("close_detect"):
+            self._vcom_result.set("该端口对已启用关闭检测。")
+            return
+        number = int(pair["pair"])
+        message = self._t("让端口对 #{pair} 在应用关闭 COM 时通知桥接结束会话？\n\n确定后 Windows 会弹出一次管理员确认。", pair=number)
+        if not self._messagebox.askyesno(self._t("启用关闭检测"), message, parent=self.root):
+            return
+        from .vcom import Com0comBackend
+        if self._start_ext("pair_wire", lambda: {"pair": number, **Com0comBackend().wire_open_signal(number)}):
+            self._vcom_result.set("正在等待管理员确认并配置端口对…")
+
+    def _remove_pair(self) -> None:
+        pair = self._selected_pair()
+        if pair is None:
+            self._show_error("无法删除端口对", "请先在列表中选择一个端口对。")
+            return
+        snapshot = self._bridge.snapshot() if self._bridge else {}
+        if snapshot.get("endpoint") == pair.get("endpoint") and snapshot.get("state") not in (None, "stopped"):
+            self._show_error("无法删除端口对", "该端口对正在被桥接使用，请先停止桥接。")
+            return
+        number = int(pair["pair"])
+        message = self._t("删除端口对 #{pair}（{com} ↔ {endpoint}）？\n\n正在使用该 COM 的程序会失去端口。确定后 Windows 会弹出一次管理员确认。",
+                          pair=number, com=_short(pair.get("com") or "—", 12), endpoint=_short(pair.get("endpoint"), 12))
+        if not self._messagebox.askyesno(self._t("删除端口对"), message, parent=self.root):
+            return
+        from .vcom import Com0comBackend
+        if self._start_ext("pair_remove", lambda: {"pair": number, **Com0comBackend().remove_pair(number)}):
+            self._vcom_result.set("正在等待管理员确认并删除端口对…")
+
+    # ------------------------------------------------------------ tab: com0com 桥接
+    def _build_bridge(self) -> None:
+        tab = self._bridge_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(6, weight=1)
+        ttk.Label(tab, text=self._t("com0com 桥接到 RFC2217"), style="Heading.TLabel").grid(row=0, column=0, sticky="w")
+        self._wrap(ttk.Label(tab, text=self._t("应用打开端口对的可见 COM；桥接打开隐藏的 CNCBn 端，把数据、波特率等设置和 DTR/RTS 转发到远端。可与网关同时运行，例如桥接到 127.0.0.1 的网关入口并让网关使用本机模拟。"), style="CardMuted.TLabel")).grid(row=1, column=0, sticky="ew", pady=(2, 8))
+        form = ttk.Frame(tab, style="Card.TFrame")
+        form.grid(row=2, column=0, sticky="ew")
+        form.columnconfigure((0, 1, 2), weight=1, uniform="bridge")
+        holder = ttk.Frame(form, style="Card.TFrame")
+        holder.grid(row=0, column=0, sticky="ew", padx=(0, 12), pady=(0, 8))
+        holder.columnconfigure(0, weight=1)
+        ttk.Label(holder, text=self._t("端口对 / 端点"), style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 3))
+        self._bridge_pair_combo = ttk.Combobox(holder, textvariable=self.ext["bridge_pair"], values=tuple(pair_label(p) for p in self._pairs), width=22)
+        self._bridge_pair_combo.grid(row=1, column=0, sticky="ew")
+        self._bridge_host_entry = self._ext_entry(form, 0, 1, "远端主机 / IP", self.ext["bridge_host"])
+        self._bridge_port_entry = self._ext_entry(form, 0, 2, "远端端口", self.ext["bridge_port"])
+        tools = ttk.Frame(tab, style="Card.TFrame")
+        tools.grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self._bridge_start_button = ttk.Button(tools, text=self._t("启动桥接"), style="Primary.TButton", command=self._start_bridge)
+        self._bridge_start_button.grid(row=0, column=0)
+        self._bridge_stop_button = ttk.Button(tools, text=self._t("停止桥接"), command=self._stop_bridge)
+        self._bridge_stop_button.grid(row=0, column=1, padx=(8, 0))
+        self._bridge_restart_button = ttk.Button(tools, text=self._t("重新开始"), command=self._restart_bridge)
+        self._bridge_restart_button.grid(row=0, column=2, padx=(8, 0))
+        self._bridge_pairs_button = ttk.Button(tools, text=self._t("刷新端口对"), command=self._refresh_vcom)
+        self._bridge_pairs_button.grid(row=0, column=3, padx=(8, 0))
+        self._bridge_fill_button = ttk.Button(tools, text=self._t("按当前配置填写"), command=self._fill_bridge_from_profile)
+        self._bridge_fill_button.grid(row=0, column=4, padx=(8, 0))
+        status = ttk.Frame(tab, style="Card.TFrame")
+        status.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        status.columnconfigure((1, 3), weight=1)
+        self._bridge_state_label = ttk.Label(status, textvariable=self._bridge_vars["state"], style="State.TLabel")
+        self._bridge_state_label.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(status, textvariable=self._bridge_vars["session"], style="CardMuted.TLabel").grid(row=0, column=2, columnspan=2, sticky="e")
+        for row, column, title, key in ((1, 0, "应用 → 设备", "app_to_device"), (1, 2, "设备 → 应用", "device_to_app")):
+            ttk.Label(status, text=self._t(title), style="CardMuted.TLabel").grid(row=row, column=column, sticky="w", padx=(0, 8), pady=(6, 0))
+            ttk.Label(status, textvariable=self._bridge_vars[key], style="Value.TLabel").grid(row=row, column=column + 1, sticky="w", pady=(6, 0))
+        for row, title, key in ((2, "当前设置", "settings"), (3, "控制线", "lines"), (4, "状态说明", "message")):
+            ttk.Label(status, text=self._t(title), style="Card.TLabel").grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=2)
+            self._wrap(ttk.Label(status, textvariable=self._bridge_vars[key], style="Card.TLabel"), 220).grid(row=row, column=1, columnspan=3, sticky="w", pady=2)
+        self._bridge_error_label = self._wrap(ttk.Label(status, textvariable=self._bridge_vars["error"], style="Error.TLabel"))
+        self._bridge_error_label.grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        self._bridge_reset_label = self._wrap(ttk.Label(tab, text=self._t(_BRIDGE_RESET_HELP), style="Warn.TLabel"))
+        self._bridge_reset_label.grid(row=5, column=0, sticky="ew", pady=(0, 6))
+        self._bridge_reset_label.grid_remove()
+        self._bridge_log = self._readonly_text(tab, row=6, height=5)
+        self._bridge_event_key = None
+        self._render_bridge()
+
+    def _start_bridge(self) -> None:
+        try:
+            endpoint, host, port = bridge_args(self.ext["bridge_pair"].get(), self.ext["bridge_host"].get(), self.ext["bridge_port"].get())
+            from .c0c_bridge import Com0comBridge
+            bridge = Com0comBridge(endpoint, host, port)
+        except ValueError as exc:
+            self._show_error("无法启动桥接", exc)
+            return
+        old = self._bridge
+
+        def work() -> dict[str, Any]:
+            if old is not None:
+                old.stop()
+            bridge.start()
+            return bridge.snapshot()
+        self._bridge = bridge
+        self._bridge_event_key = None
+        if self._start_ext("bridge_start", work):
+            self._add_event("INFO", f"启动 com0com 桥接：{endpoint} → {_address(host, port)}。")
+
+    def _stop_bridge(self) -> None:
+        bridge = self._bridge
+        if bridge is not None:
+            self._start_ext("bridge_stop", lambda: (bridge.stop(), bridge.snapshot())[1])
+
+    def _restart_bridge(self) -> None:
+        bridge = self._bridge
+        if bridge is None:
+            return
+        if not self._messagebox.askokcancel(self._t("重新开始桥接"), self._t(_BRIDGE_RESET_HELP) + "\n\n" + self._t("新会话从零开始，旧数据不会续传。是否继续？"), parent=self.root):
+            return
+
+        def work() -> dict[str, Any]:
+            bridge.stop()
+            bridge.start()
+            return bridge.snapshot()
+        self._start_ext("bridge_restart", work)
+
+    def _render_bridge(self) -> None:
+        if not hasattr(self, "_bridge_log"):
+            return
+        snapshot = self._bridge.snapshot() if self._bridge is not None else None
+        state = snapshot.get("state", "stopped") if snapshot else None
+        tr = self._t
+        if snapshot is None:
+            label, color = "未启动", _MUTED
+        else:
+            label, color = _BRIDGE_STATES.get(state, ("状态未知", _MUTED))
+        self._bridge_vars["state"].set(label)
+        self._bridge_state_label.configure(foreground=color)
+        snapshot = snapshot or {}
+        self._bridge_vars["session"].set(tr("会话 {session} · 端点 {endpoint} → {remote} · 请求 {requests}",
+                                            session=snapshot.get("session_id") or "—", endpoint=_short(snapshot.get("endpoint") or "—", 12),
+                                            remote=_short(snapshot.get("remote") or "—", 60), requests=snapshot.get("requests_sent", 0)))
+        self._bridge_vars["app_to_device"].set(_byte_count(snapshot.get("app_to_device", 0)))
+        self._bridge_vars["device_to_app"].set(_byte_count(snapshot.get("device_to_app", 0)))
+        self._bridge_vars["settings"].set(bridge_settings_text(snapshot.get("settings"), tr))
+        lines = snapshot.get("lines") or {}
+        self._bridge_vars["lines"].set(" · ".join(f"{name.upper()} {tr('开') if lines[name] else tr('关')}" for name in ("dtr", "rts", "break") if name in lines) or "—")
+        self._bridge_vars["message"].set(_short(snapshot.get("message") or "—", 200))
+        error = snapshot.get("last_error")
+        self._bridge_vars["error"].set(tr("最近错误：{error}", error=_short(error, 160)) if error else "")
+        if error:
+            self._bridge_error_label.grid()
+        else:
+            self._bridge_error_label.grid_remove()
+        if state == "needs_reset":
+            self._bridge_reset_label.grid()
+        else:
+            self._bridge_reset_label.grid_remove()
+        events = snapshot.get("events") or []
+        key = (id(self._bridge), len(events), events[-1].get("time") if events else None)
+        if key != self._bridge_event_key:
+            self._bridge_event_key = key
+            text = "\n".join(f"{_short(e.get('time', ''), 32)}  [{tr({'info': '信息', 'warning': '提醒', 'error': '错误'}.get(str(e.get('level')), str(e.get('level'))))}]  {_short(e.get('message', ''), 300)}"
+                             for e in events if isinstance(e, dict))
+            self._set_text(self._bridge_log, text or tr("尚无桥接事件。"))
+            self._bridge_log.see("end")
+        if state != self._bridge_state:
+            previous, self._bridge_state = self._bridge_state, state
+            if previous is not None and state is not None:
+                self._add_event("ERROR" if state in ("needs_reset", "error") else "INFO", f"com0com 桥接状态：{label}。")
+            self._sync_controls()
+
+    # ------------------------------------------------------------ tab: ESP32 设备
+    def _build_device(self) -> None:
+        tab = self._device_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(6, weight=1)
+        ttk.Label(tab, text=self._t("ESP32 网关设备检查"), style="Heading.TLabel").grid(row=0, column=0, sticky="w")
+        self._wrap(ttk.Label(tab, text=self._t("只读检查：TCP 连接、可选 RFC2217 波特率探测、HTTP 状态接口。令牌只保存在本窗口内存中，不写入配置、日志或诊断。"), style="CardMuted.TLabel")).grid(row=1, column=0, sticky="ew", pady=(2, 8))
+        form = ttk.Frame(tab, style="Card.TFrame")
+        form.grid(row=2, column=0, sticky="ew")
+        form.columnconfigure((0, 1, 2), weight=1, uniform="device")
+        self._ext_entry(form, 0, 0, "设备主机 / IP", self.ext["dev_host"])
+        self._ext_entry(form, 0, 1, "RFC2217 端口", self.ext["dev_port"])
+        self._ext_entry(form, 0, 2, "HTTP 端口", self.ext["dev_http"])
+        self._ext_entry(form, 1, 0, "状态路径", self.ext["dev_path"])
+        self._ext_entry(form, 1, 1, "鉴权请求头", self.ext["dev_header"])
+        self._ext_entry(form, 1, 2, "令牌（可选）", self._token_var, show="•")
+        probe = ttk.Frame(tab, style="Card.TFrame")
+        probe.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        probe.columnconfigure(2, weight=1)
+        ttk.Checkbutton(probe, text=self._t("探测波特率"), variable=self._probe_var).grid(row=0, column=0, sticky="w")
+        ttk.Entry(probe, textvariable=self.ext["dev_baud"], width=10).grid(row=0, column=1, sticky="w", padx=(6, 10))
+        self._wrap(ttk.Label(probe, text=self._t("探测会发送一次设置波特率请求，远端 UART 速度会被改为该值，直到下一次会话重新设置。"), style="Warn.TLabel"), 330).grid(row=0, column=2, sticky="ew")
+        tools = ttk.Frame(tab, style="Card.TFrame")
+        tools.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        self._device_check_button = ttk.Button(tools, text=self._t("检测设备"), style="Primary.TButton", command=self._check_device)
+        self._device_check_button.grid(row=0, column=0, sticky="w")
+        self._device_scan_button = ttk.Button(tools, text=self._t("扫描局域网"), command=self._scan_devices)
+        self._device_scan_button.grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(tools, text=self._t("网段（留空自动）"), style="CardMuted.TLabel").grid(row=0, column=2, padx=(12, 4))
+        ttk.Entry(tools, textvariable=self.ext["scan_net"], width=18).grid(row=0, column=3, sticky="w")
+        ttk.Label(tools, textvariable=self._device_status, style="CardMuted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        hosts = ttk.Frame(tab, style="Card.TFrame")
+        hosts.grid(row=5, column=0, sticky="ew", pady=(0, 6))
+        hosts.columnconfigure(0, weight=1)
+        self._scan_list = tk.Listbox(hosts, height=3, activestyle="none", background="#F6F8FB", foreground=_NAVY,
+                                     relief="flat", highlightthickness=1, highlightbackground="#E1E8EF", font=(self._font_family, 9))
+        self._scan_list.grid(row=0, column=0, sticky="ew")
+        scroll = ttk.Scrollbar(hosts, command=self._scan_list.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self._scan_list.configure(yscrollcommand=scroll.set)
+        self._scan_list.bind("<<ListboxSelect>>", self._pick_scanned_host, add="+")
+        self._scan_list.bind("<Double-Button-1>", lambda event: (self._pick_scanned_host(event), self._check_device()), add="+")
+        self._device_text = self._readonly_text(tab, row=6, height=7)
+        self._render_device()
+
+    def _pick_scanned_host(self, _event: tk.Event | None = None) -> None:
+        selection = self._scan_list.curselection()
+        if selection and selection[0] < len(self._scan_hosts):
+            self.ext["dev_host"].set(self._scan_hosts[selection[0]])
+
+    def _render_device(self) -> None:
+        if not hasattr(self, "_device_text"):
+            return
+        if self._device_error:
+            text = self._t("检测失败：{error}", error=self._t.event(self._device_error))
+        else:
+            text = format_device_report(self._device_raw, self._t)
+        self._set_text(self._device_text, text)
+        self._scan_list.delete(0, "end")
+        for host in self._scan_hosts:
+            self._scan_list.insert("end", host)
+        self._device_status.refresh()
+
+    def _check_device(self) -> None:
+        try:
+            kwargs = device_check_args(self.ext["dev_host"].get(), self.ext["dev_port"].get(), self.ext["dev_http"].get(),
+                                       self.ext["dev_path"].get(), self.ext["dev_header"].get(), self._probe_var.get(), self.ext["dev_baud"].get())
+        except ValueError as exc:
+            self._show_error("无法检测设备", exc)
+            return
+        if kwargs["probe_baud"] and not self._messagebox.askokcancel(
+                self._t("探测波特率"), self._t("探测会把远端 UART 波特率设为 {baud}。若设备正在被其他程序使用，请取消。是否继续？", baud=kwargs["probe_baud"]), parent=self.root):
+            return
+        token = self._token_var.get()
+
+        def work() -> dict[str, Any]:
+            from .device_probe import check_device
+            return check_device(token=token, **kwargs)
+        if self._start_ext("device_check", work):
+            self._device_status.set("正在检测设备…")
+
+    def _scan_devices(self) -> None:
+        import ipaddress
+        network = self.ext["scan_net"].get().strip()
+        try:
+            port = int(self.ext["dev_port"].get().strip())
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            self._show_error("无法扫描", "RFC2217 端口应在 1–65535 之间。")
+            return
+        if network:
+            try:
+                net = ipaddress.ip_network(network, strict=False)
+                if net.version != 4 or not net.is_private or net.num_addresses > 256:
+                    raise ValueError
+            except ValueError:
+                self._show_error("无法扫描", "只能扫描 /24 或更小的私有 IPv4 网段，例如 192.168.50.0/24。")
+                return
+
+        def work() -> dict[str, Any]:
+            from .device_probe import local_networks, scan_subnet
+            networks = [network] if network else local_networks()[:4]
+            if not networks:
+                raise ValueError("未发现本机私有 IPv4 网段，请手动填写网段。")
+            hosts: list[str] = []
+            for item in networks:
+                hosts.extend(scan_subnet(item, port))
+            return {"networks": networks, "hosts": hosts}
+        if self._start_ext("device_scan", work):
+            self._device_status.set("正在扫描局域网…")
+
+    # ------------------------------------------------------------ shared
+    def _sync_extension_controls(self) -> None:
+        if not hasattr(self, "_device_scan_button"):
+            return
+        busy, closing = self._ext_pending, self._closing
+
+        def state(enabled: bool) -> str:
+            return "normal" if enabled and not closing else "disabled"
+        vcom_busy = bool(busy & {"vcom_detect", "vcom_apply", "pair_create", "pair_remove", "pair_wire"})
+        hw = self._backend("HW VSP3 Single") or {}
+        c0c = self._backend("com0com") or {}
+        self._vcom_refresh_button.configure(state=state(not vcom_busy))
+        self._bridge_pairs_button.configure(state=state(not vcom_busy))
+        self._vcom_preview_button.configure(state=state(True))
+        self._vcom_apply_button.configure(state=state(not vcom_busy and bool(hw.get("installed"))))
+        self._pair_create_button.configure(state=state(not vcom_busy and bool(c0c.get("installed"))))
+        self._pair_remove_button.configure(state=state(not vcom_busy and bool(c0c.get("installed")) and self._selected_pair() is not None))
+        selected = self._selected_pair()
+        self._pair_wire_button.configure(state=state(not vcom_busy and selected is not None and not selected.get("close_detect")))
+        bridge_busy = bool(busy & {"bridge_start", "bridge_stop", "bridge_restart", "bridge_shutdown"})
+        current = self._bridge.snapshot().get("state") if self._bridge is not None else None
+        live = current in ("starting", "connecting", "active")
+        self._bridge_start_button.configure(state=state(not bridge_busy and not live))
+        self._bridge_stop_button.configure(state=state(not bridge_busy and current not in (None, "stopped")))
+        self._bridge_restart_button.configure(state=state(not bridge_busy and current == "needs_reset"))
+        editable = not bridge_busy and not live and not closing
+        self._bridge_pair_combo.configure(state="normal" if editable else "disabled")
+        for widget in (self._bridge_host_entry, self._bridge_port_entry, self._bridge_fill_button):
+            widget.configure(state="normal" if editable else "disabled")
+        self._device_check_button.configure(state=state("device_check" not in busy))
+        self._device_scan_button.configure(state=state("device_scan" not in busy))
+
+    def _handle_extension_reply(self, reply: Reply) -> None:
+        task = reply.task
+        self._ext_pending.discard(task)
+        error = reply.error
+        result = reply.result if isinstance(reply.result, dict) else {}
+        if task == "vcom_detect":
+            if error:
+                self._vcom_result.set("驱动检测失败：" + error)
+            else:
+                self._vcom_raw = result.get("backends") or []
+                self._vcom_matrix = result.get("matrix") or []
+                self._vcom_suggest = str(result.get("suggest") or "")
+                c0c = self._backend("com0com") or {}
+                self._pairs = [{"pair": int(end[4:]), "com": com, "endpoint": end}
+                               for end, com in sorted((c0c.get("channel") or {}).items()) if str(end).startswith("CNCB") and str(end)[4:].isdigit()]
+                configured = str(((self._backend("HW VSP3 Single") or {}).get("channel") or {}).get("COM") or "")
+                if not self.ext["vcom_com"].get():
+                    self.ext["vcom_com"].set(configured or self._vcom_suggest)
+                if not self.ext["bridge_pair"].get() and self._pairs:
+                    self.ext["bridge_pair"].set(pair_label(self._pairs[0]))
+                self._vcom_result.set("驱动检测完成（只读）。")
+            self._render_vcom()
+        elif task in ("vcom_apply", "pair_create", "pair_remove", "pair_wire"):
+            names = {"vcom_apply": "应用 HW VSP 配置", "pair_create": "新建端口对", "pair_remove": "删除端口对",
+                     "pair_wire": "启用关闭检测"}
+            if error:
+                outcome = f"{names[task]}失败：{error}"
+            elif not result.get("ok"):
+                outcome = f"{names[task]}未成功：{clean_text(result.get('error') or '—', 80)}"
+            elif task in ("vcom_apply", "pair_create") and not result.get("port_present"):
+                outcome = f"{names[task]}已执行，但 20 秒内未看到虚拟端口出现，请刷新检测。"
+            else:
+                outcome = f"{names[task]}已完成。"
+            self._vcom_result.set(outcome)
+            self._add_event("INFO" if result.get("ok") and not error else "ERROR", outcome)
+            self._sync_controls()
+            self._refresh_vcom()
+            return
+        elif task in ("bridge_start", "bridge_stop", "bridge_restart"):
+            if error:
+                self._add_event("ERROR", "com0com 桥接操作失败：" + error)
+                if not self._closing:
+                    self._show_error("桥接操作未完成", error)
+            self._render_bridge()
+        elif task == "bridge_shutdown":
+            pass
+        elif task == "device_check":
+            self._device_error = error or ""
+            self._device_raw = None if error else result
+            self._device_status.set("设备检测失败。" if error else "设备检测完成。")
+            self._render_device()
+        elif task == "device_scan":
+            if error:
+                self._device_status.set("扫描失败：" + error)
+            else:
+                self._scan_hosts = [str(h) for h in result.get("hosts", [])][:256]
+                self._device_status.set(f"扫描完成：{len(self._scan_hosts)} 台主机开放端口（{', '.join(result.get('networks', []))}）。")
+                if len(self._scan_hosts) == 1:
+                    self.ext["dev_host"].set(self._scan_hosts[0])
+            self._render_device()
+        self._sync_controls()
 
     def _readonly_text(self, parent: ttk.Frame, row: int, height: int) -> tk.Text:
         holder = ttk.Frame(parent, style="Card.TFrame")
@@ -865,12 +1553,14 @@ class _GatewayApp:
         self._environment_button.configure(state="disabled" if self._closing or "environment" in self._aux_pending else "normal")
         self._selftest_button.configure(state="disabled" if self._closing or "selftest" in self._aux_pending else "normal")
         self._copy_endpoint_button.configure(state="normal" if not self._closing and self._endpoint()[2] else "disabled")
+        self._sync_extension_controls()
         if self._closing:
             task = "正在停止并等待后台任务收尾…"
         elif self._gateway_busy:
             task = {"start": "正在启动…", "stop": "正在停止…", "rearm": "正在重新就绪…"}.get(self._gateway_busy, "正在处理…")
-        elif self._aux_pending:
-            task = " / ".join(self._t("环境检查中" if key == "environment" else "自检中") for key in sorted(self._aux_pending))
+        elif self._aux_pending or self._ext_pending:
+            task = " / ".join([self._t("环境检查中" if key == "environment" else "自检中") for key in sorted(self._aux_pending)]
+                              + [self._t(_EXT_TASKS[key]) for key in sorted(self._ext_pending) if key in _EXT_TASKS])
         else:
             task = ""
         self._task_text.set(task)
@@ -972,8 +1662,11 @@ class _GatewayApp:
                 break
             self._handle_reply(reply)
         self._render_events()
+        if time.monotonic() >= self._next_bridge_render:
+            self._next_bridge_render = time.monotonic() + 0.25
+            self._render_bridge()
         if self._closing:
-            if self._shutdown_complete and not self._aux_pending:
+            if self._shutdown_complete and not self._aux_pending and "bridge_shutdown" not in self._ext_pending:
                 self.root.destroy()
                 return
             if time.monotonic() >= self._close_deadline and not self._close_warning_shown:
@@ -991,6 +1684,9 @@ class _GatewayApp:
 
     def _handle_reply(self, reply: Reply) -> None:
         task = reply.task
+        if task in _EXT_TASKS:
+            self._handle_extension_reply(reply)
+            return
         if task in ("environment", "selftest"):
             self._aux_pending.discard(task)
             if reply.error:
@@ -1246,6 +1942,7 @@ class _GatewayApp:
             return
         document = diagnostic_document(self._snapshot, profile, self._t.language)
         document["profile_source"] = "last_run" if self._run_profile else "current_form"
+        extend_diagnostics(document, self._vcom_raw, self._bridge.snapshot() if self._bridge else None, self._device_raw)
         path = self._filedialog.asksaveasfilename(parent=self.root, title="导出网关诊断（不含载荷和配置备注）", defaultextension=".json", initialfile=f"gateway-diagnostic-{datetime.now():%Y%m%d-%H%M%S}.json", filetypes=[("JSON 诊断", "*.json")])
         if not path:
             return
@@ -1263,7 +1960,7 @@ class _GatewayApp:
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)
             self._add_event("INFO", "诊断已导出；包含服务快照和对应配置，不含传输载荷或配置备注。")
-            self._messagebox.showinfo("诊断已导出", "已导出服务快照与对应配置。传输载荷、配置备注及未列入诊断白名单的字段不会导出。", parent=self.root)
+            self._messagebox.showinfo("诊断已导出", "已导出服务快照与对应配置，以及虚拟 COM 检测、桥接状态和最近一次设备检测摘要。传输载荷、令牌、配置备注及未列入诊断白名单的字段不会导出。", parent=self.root)
         except Exception as exc:
             self._show_error("诊断导出失败", exc)
         finally:
@@ -1302,6 +1999,10 @@ class _GatewayApp:
         self._close_warning_shown = False
         self._gateway_busy = "shutdown"
         self._worker.submit("shutdown")
+        bridge = self._bridge
+        if bridge is not None and bridge.snapshot().get("state") != "stopped" and "bridge_shutdown" not in self._ext_pending:
+            self._ext_pending.add("bridge_shutdown")
+            run_background("bridge_shutdown", bridge.stop, self._replies)
         self._render_snapshot()
         self._sync_controls()
 

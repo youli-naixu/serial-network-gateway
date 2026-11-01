@@ -15,6 +15,8 @@ PATTERNS = {
     "github-secret": re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b"),
     "local-owner": re.compile(r"(?i)tomori[ _-]?nao|homelab-ops|0vo\.top"),
 }
+# Placeholder ranges used in examples and tests; real deployments must not appear.
+ALLOWED_EXAMPLE_IPS = re.compile(r"\b(?:192\.168\.50\.\d{1,3}|10\.0\.0\.0/16)\b")
 BANNED_PARTS = {".local-tools", ".local", ".codex", ".pio", ".pio-core", "__pycache__", "artifacts", "dist", "build"}
 BANNED_SUFFIXES = {".exe", ".dll", ".sys", ".cat", ".pfx", ".p12", ".pem", ".key", ".zip", ".bin"}
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".toml", ".ini", ".yml", ".yaml", ".c", ".h", ".csv", ".spec"}
@@ -42,12 +44,15 @@ def main() -> int:
             continue
         for number, line in enumerate(text.splitlines(), 1):
             for kind, pattern in PATTERNS.items():
-                if pattern.search(line):
+                checked = ALLOWED_EXAMPLE_IPS.sub("", line) if kind == "private-ip" else line
+                if pattern.search(checked):
                     errors.append((relative, number, kind))
             if re.search(r"CONFIG_\w*(?:PASSWORD|SSID)\w*\s*=\s*\"[^\"]+\"", line):
                 errors.append((relative, number, "nonempty wireless credential"))
         if path.suffix == ".md":
-            for target in re.findall(r"\]\(([^)]+)\)", text):
+            prose = re.sub(r"```.*?```", "", text, flags=re.S)
+            prose = re.sub(r"`[^`\n]*`", "", prose)
+            for target in re.findall(r"\]\(([^)]+)\)", prose):
                 target = target.strip("<>").split("#", 1)[0]
                 if not target or "://" in target or target.startswith(("mailto:", "#")):
                     continue

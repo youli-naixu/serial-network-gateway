@@ -36,7 +36,11 @@ class Simulator:
 
     def __init__(self, protocol: str = "rfc2217", host: str = "127.0.0.1", port: int = 0,
                  *, buffer_bytes: int = 4096, chunk_bytes: int = 1024,
-                 stall_timeout_s: float = 10.0) -> None:
+                 stall_timeout_s: float = 10.0, quiet: bool = True) -> None:
+        # quiet: never send unsolicited Telnet negotiation or modem/line
+        # notifications. Some virtual COM drivers (HW VSP3 Single) only parse
+        # replies to their own COM-PORT-OPTION requests and pass any other
+        # option bytes to the application as serial data.
         if protocol not in ("raw", "rfc2217"):
             raise ValueError("模拟器协议必须为 raw 或 rfc2217。")
         if host not in ("127.0.0.1", "::1"):
@@ -48,6 +52,7 @@ class Simulator:
         self.protocol, self.host, self.port = protocol, host, port
         self.buffer_bytes, self.chunk_bytes = buffer_bytes, chunk_bytes
         self.stall_timeout_s = stall_timeout_s
+        self.quiet = quiet
         self.bound_host, self.bound_port = host, 0
         self._server = None
         self._tasks: set[asyncio.Task] = set()
@@ -189,7 +194,7 @@ class Simulator:
                 response = value
             if response is not None:
                 await send(subnegotiation(command + 100, response))
-                if command in (10, 11):
+                if command in (10, 11) and not self.quiet:
                     await notify(command - 4)
                 elif command == 9 and pending:
                     output = bytes(pending)
@@ -197,7 +202,7 @@ class Simulator:
                     await send(escape_data(output))
 
         try:
-            if self.protocol == "rfc2217":
+            if self.protocol == "rfc2217" and not self.quiet:
                 for option in (BINARY, SGA, COM_PORT_OPTION):
                     local_options.add(option)
                     remote_options.add(option)

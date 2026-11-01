@@ -1,109 +1,116 @@
-# Serial Network Gateway
+# Serial Network Gateway 串口网络网关
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-面向 Windows 应用和不同 UART 目标的通用串口网络工具。PC 网关提供回环 TCP 入口、raw TCP 或 RFC2217 透明转发、配置档、会话统计和本机回显模拟器。独立的 ESP32-S3 固件正在使用 ESP-IDF 和 `igrr/rfc2217-server` 实现。
+通过网络使用串口。Windows 程序打开一个普通的 `COMx` 口，数据、串口参数和控制线经 TCP/RFC2217 传到 ESP32，由 ESP32 驱动真实 UART。项目是通用的：起因是无线烧录一块语音模块，但数据通路里没有任何针对特定芯片的处理。
 
-**目标版本：`0.2.0-alpha.1`，本地验收待完成。** 先前的 `0.1.0` PC 原型曾有 99 项测试在本机通过。该历史结果不能验证当前修订、Windows 虚拟 COM 驱动、固件或真实目标。当前证据边界见[验证矩阵](docs/verification.zh-CN.md)。本项目尚不声称 ASR 开箱可烧录或硬件已通过测试。
-
-## 工作方式
+**状态：`0.3.0-alpha`。电脑端已在 Windows 11 上用真实虚拟 COM 驱动跑通端到端；ESP32 库已能编译，尚未在实物上运行。** 详见[验证矩阵](docs/verification.zh-CN.md)。
 
 ```text
-串口应用
-    |
-    v
-单独安装的虚拟 COM 驱动和重定向器
-    |  raw TCP 或 RFC2217
-    v
-PC 网关 127.0.0.1:7000
-    |
-    +--> 内置本机回显模拟器
-    |
-    +--> 网络 UART 端点 --> UART 目标
-         （ESP32-S3 固件开发中）
+应用程序（烧录工具、串口助手……）
+   │ 打开 COM11
+   ▼
+com0com 端口对  COM11 ↔ CNCB0        （或 HW VSP3：COM10 → TCP）
+   ▼
+电脑端桥接：数据、串口参数、DTR/RTS、BREAK → RFC2217
+   ▼ TCP
+ESP32 网关库 ── UART ──▶ 目标板
 ```
 
-原生支持 TCP 或 RFC2217 的客户端可以直接连接，无需虚拟 COM 驱动。PC 网关自身不创建 Windows COM 设备。它转发所选协议，不负责将 raw TCP 转换成 RFC2217。
+## 功能
 
-ASR PRO 是一个拟验证的目标实例。其他 UART 目标在协议、电气接口和控制要求匹配时也可以复用 PC 传输层。模拟器是回显端点，不是目标芯片的 Bootloader。
+**桌面程序（Windows，Python/Tk，中英双语）**，一个窗口六个页签：
 
-## 从源码快速开始
+| 页签 | 作用 |
+| --- | --- |
+| 基本配置 / 高级参数 | 配置档（可导入导出）、原始 TCP 或 RFC2217、超时和缓冲区大小。 |
+| 连接与统计 | 双向字节计数、队列峰值、请求与确认的串口参数、事件记录。 |
+| 虚拟 COM | 检测 HW VSP3 Single 与 com0com，并列出各自能转发的内容；配置 HW VSP 通道，新建和删除 com0com 端口对。每次修改会弹出一次 Windows 管理员确认。 |
+| com0com 桥接 | 把端口对的隐藏端接到 RFC2217 端点。打开串口**之后**再改波特率和格式也能转发，同时转发 DTR、RTS、BREAK。应用关闭串口时会话随之结束。 |
+| ESP32 设备 | TCP 连通性、可选的 RFC2217 波特率探测、设备 HTTP 状态，以及局域网扫描。令牌只保存在内存里。 |
 
-在仓库根目录运行以下命令。构建目标为 Windows 和 Python 3.11 或更高版本；先前本机原型使用 Python 3.14。当前 alpha 的逐版本验证尚待完成。GUI 需要 Tk 支持。
+内置本机回显模拟器和自检，不接硬件也能测试整条链路。所有功能也能通过命令行使用。
+
+**ESP32 库（`arduino/`，Arduino-ESP32 2.x）。** `SerialNetworkGateway` 给现有固件加上“维护模式”：开启期间接管一路 UART 并通过 RFC2217 转发，结束后把 UART 交还原业务。使用有界队列，出错时明确报告而不是丢数据；同一时间只接一个客户端，数据不跨会话；支持来源 IP 白名单，超时自动退出。可选的 RESET、BOOT 引脚由你自己的已鉴权代码触发。
+
+`firmware/` 目录保留一份独立的 ESP-IDF 固件作为备选。
+
+## 选哪个虚拟 COM 驱动
+
+本项目不附带内核驱动，只管理你自行安装的驱动：
+
+| 在 Windows 11 23H2 实测 | HW VSP3 Single 3.1.2 | com0com 3.0.0.0（已签名）+ 本项目桥接 |
+| --- | --- | --- |
+| 二进制数据、打开时的参数 | 支持 | 支持 |
+| 打开后修改波特率 | 仅 57600 及以下 | 支持，已测 1.5 Mbaud |
+| 修改数据位 / 校验 / 停止位 | 只有同时改波特率才下发 | 支持 |
+| DTR / RTS / BREAK | 不支持 | 支持 |
+| 应用关闭串口时结束会话 | 支持 | 支持（关闭检测） |
+
+目标板需要复位线或会话中途切换波特率时（大多数 Bootloader 都需要），用 **com0com**。只需固定速率传数据时，HW VSP 更简单。
+
+HW VSP 还会把服务器主动发出的 Telnet 选项字节当成串口数据交给应用，所以网关默认使用“安静模式”，只回应客户端的请求。
+
+## 快速开始
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe -m serial_gateway selftest --output artifacts/selftest.json
+.\.venv\Scripts\python.exe -m serial_gateway selftest
 .\.venv\Scripts\python.exe -m serial_gateway gui
 ```
 
-自检成功时退出码为 `0`，报告中有 `"ok": true`。它创建临时回环端点，不读取真实设备配置、不打开 COM 设备。raw TCP 和 RFC2217 客户端示例见[可复现 PC 模拟指南](docs/simulation.zh-CN.md)。
+用 com0com 做不接硬件的回环测试：
 
-先前 GUI 原型为中文。英文 GUI 支持正在开发；提供英文文档不代表所有界面文字已经翻译并检查。打开 GUI 不会启动连接。接入驱动或设备前先使用模拟器。
+1. 在 **虚拟 COM** 页点击“新建端口对…”（例如 `COM11`），在弹出的管理员确认中点“是”。
+2. 在 **基本配置** 页保持“本机模拟”，点击“启动网关”。
+3. 在 **com0com 桥接** 页选择端口对，点击“启动桥接”，目标默认是 `127.0.0.1:7000`。
+4. 用任意串口助手打开 `COM11`：发出的数据会原样返回，网关会显示你设置的串口参数和 DTR/RTS。
 
-此源码快速开始不承诺已有可下载二进制、已签名安装器或已验证便携版。打包验收单独记录。
-
-## 能力与边界
-
-| 范围 | PC 实现及边界 |
-| --- | --- |
-| 传输 | raw TCP 和 RFC2217 转发；通过旁路观察 RFC2217 获取协议统计，不改写转发流。 |
-| 本机监听 | 仅限回环地址。示例使用 `127.0.0.1`。单个活跃客户端，拒绝并发客户端。 |
-| 缓冲 | 双向有界应用队列、背压、可配置块大小和超时。队列上限不代表所有操作系统或驱动缓冲都有同一上限。 |
-| 会话 | 断线结束当前会话并丢弃应用待发队列。不自动重放或续传。 |
-| 配置档 | JSON 配置档、GUI 导入导出、schema 校验、原子保存。 |
-| 诊断 | 本机模拟、字节和队列计数、观察串口请求与回复、只读环境检查。 |
-| 虚拟 COM | 需要外部产品。可选 hub4com 适配器使用已有 com0com 端口对，不安装驱动。 |
-| 固件 | 独立 ESP-IDF ESP32-S3 实现正在开发；构建和硬件验收待完成。 |
-| 目标烧录 | 取决于应用和目标。TCP 送达和 RFC2217 回复不能证明烧录成功或真实控制信号时序正确。 |
-
-raw TCP 只传输字节，应提前在远端设置 UART 参数。RFC2217 的参数协商能力取决于驱动、远端实现和实际接线。模拟器接受 DTR、RTS、BREAK 或某个波特率，不代表硬件能复现这些设置。
+连接真实设备时，把桥接目标改成 ESP32 的地址和端口（默认 `3333`）。
 
 ## 命令行
 
-激活虚拟环境，或明确使用虚拟环境内的 Python：
-
 ```powershell
 python -m serial_gateway --help
-python -m serial_gateway --version
-python -m serial_gateway profiles
-python -m serial_gateway environment
-python -m serial_gateway selftest --bytes 65536 --output artifacts/selftest.json
+python -m serial_gateway vcom status
+python -m serial_gateway vcom create-pair --com COM11 --yes
+python -m serial_gateway bridge --endpoint CNCB0 --host 127.0.0.1 --port 7000
+python -m serial_gateway device check --host 192.168.50.20 --token-env GATEWAY_TOKEN
+python -m serial_gateway device scan
 python -m serial_gateway serve --simulate --port 7000
-python -m serial_gateway driver-help --protocol rfc2217 --port 7000
 ```
 
-`--config` 是全局选项，放在子命令之前。例如 `python -m serial_gateway --config local-profiles.json profiles` 读取[模拟指南](docs/simulation.zh-CN.md)中的配置。`serve --duration 30` 设置有界运行时间；`--port 0` 申请临时本机端口。
+会修改系统的命令必须加 `--yes`。令牌只能通过 `--token-env` 指定的环境变量读取。
 
-会话结束后，关闭应用的 COM 连接并清理重定向器的旧会话。GUI 中显式重新就绪；CLI 中重新启动 `serve` 进程。除了退出码，还应检查最终状态和错误字段。
+## 安全提示
 
-`environment` 只读取设备元信息和已安装软件登记，不打开 COM。输出可能包含设备标识和本机路径，分享前需要脱敏。
+- 只能使用 3.3 V 电平。目标板的 RX 线上只能有一个发送端；接 ESP32 TX 之前，先断开或隔离板载 USB 转串口芯片。
+- RFC2217 没有鉴权。ESP32 要放在可信网络中，并设置来源 IP 白名单。
+- 导出诊断时不包含令牌、数据内容和安装路径。
 
 ## 文档
 
-| 指南 | 内容 |
+| 文档 | 内容 |
 | --- | --- |
-| [PC 模拟](docs/simulation.zh-CN.md) | 源码环境、确定性配置、二进制回显检查、预期结果。 |
-| [Windows 虚拟 COM](docs/windows-virtual-com.zh-CN.md) | HW VSP3 和 com0com/hub4com 路线及驱动验收流程。 |
-| [远端接口约定](docs/remote-contract.zh-CN.md) | raw/RFC2217 行为、控制参数、会话及网络边界。 |
-| [固件构建](docs/firmware.zh-CN.md) | 独立 ESP-IDF 构建前置条件和证据门禁。 |
-| [硬件验证](docs/hardware-validation.zh-CN.md) | ESP32-S3 电气检查、UART/控制验证、ASR 实例门禁。 |
-| [验证矩阵](docs/verification.zh-CN.md) | 原型历史证据、当前待验收项、公开发布门禁。 |
+| [Windows 虚拟 COM](docs/windows-virtual-com.zh-CN.md) | 驱动安装、实测行为、关闭检测。 |
+| [远端接口约定](docs/remote-contract.zh-CN.md) | 网络端需要实现的内容。 |
+| [电脑端模拟](docs/simulation.zh-CN.md) | 不接硬件的可复现测试。 |
+| [ESP32 库](arduino/README.zh-CN.md) | 接线、API、嵌入现有固件。 |
+| [ESP-IDF 固件](docs/firmware.zh-CN.md) | 备选的独立固件。 |
+| [硬件验收](docs/hardware-validation.zh-CN.md) | 连接真实目标板之前的步骤。 |
+| [验证矩阵](docs/verification.zh-CN.md) | 哪些已测试、哪些尚未测试。 |
 
-每篇指南顶部均链接对应英文版本。
-
-## 开发与发布
+## 开发
 
 ```powershell
 python -m pip install -e ".[dev]"
-python -m pytest -q
-python -m serial_gateway selftest --output artifacts/selftest.json
-python -m serial_gateway gui
+python -m pytest -q -W error::ResourceWarning
+python tools/check_public_tree.py
 ```
 
-打包前检查两种 GUI 语言与显示缩放。记录准确源码修订、Windows/Python 版本、测试结果和产物校验值。二进制发布与公开上传须先完成所声明范围的本地验收；未完成的驱动或硬件条目必须保留待验证标记。另见[贡献指南](CONTRIBUTING.zh-CN.md)、[安全政策](SECURITY.zh-CN.md)和[变更日志](CHANGELOG.md)。
+另见[贡献指南](CONTRIBUTING.zh-CN.md)、[安全说明](SECURITY.zh-CN.md)和[更新记录](CHANGELOG.md)。
 
-## 许可与第三方软件
+## 许可证
 
-本项目原创代码和文档使用 [Apache License 2.0](LICENSE)。署名和依赖边界见 [NOTICE](NOTICE)。pySerial 使用 BSD-3-Clause，`igrr/rfc2217-server` 组件使用 Apache-2.0。虚拟 COM 产品是独立获取的第三方工具，本项目不捆绑或重新许可这些产品。
+Apache License 2.0，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。`arduino/src/rfc2217/` 和 `firmware/` 中的 RFC2217 解析器来自 [igrr/rfc2217-server](https://github.com/igrr/rfc2217-server)（Apache-2.0），本地修改列在源码中。pySerial 采用 BSD-3-Clause。HW VSP3 和 com0com 是独立产品，本项目不附带。

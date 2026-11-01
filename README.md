@@ -2,108 +2,115 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A reusable serial-over-network toolkit for Windows applications and UART targets. The PC gateway provides a loopback TCP endpoint, transparent raw TCP or RFC2217 forwarding, profiles, session statistics, and a local echo simulator. A separate ESP32-S3 firmware implementation is being prepared with ESP-IDF and `igrr/rfc2217-server`.
+Use a serial port over the network. A Windows application opens an ordinary `COMx` port; the bytes, serial settings and control lines travel over TCP/RFC2217 to an ESP32, which drives a real UART. The project is generic: it was started to flash a voice module wirelessly, but nothing in the data path is target specific.
 
-**Release target: `0.2.0-alpha.1` — local acceptance pending.** The previous `0.1.0` PC prototype had 99 locally passing tests. That historical result does not verify this revision, a Windows virtual COM driver, firmware, or a physical target. See the [verification matrix](docs/verification.md) for the current evidence boundaries. No ready-to-use ASR flashing or hardware-tested claim is made.
-
-## How it fits together
+**Status: `0.3.0-alpha`. The PC side has been tested end to end with real virtual COM drivers on Windows 11. The ESP32 library compiles but has not yet run on hardware.** See the [verification matrix](docs/verification.md).
 
 ```text
-Serial application
-    |
-    v
-Separately installed virtual COM driver + redirector
-    |  raw TCP or RFC2217
-    v
-PC gateway at 127.0.0.1:7000
-    |
-    +--> Built-in local echo simulator
-    |
-    +--> Network UART endpoint --> UART target
-         (ESP32-S3 firmware under development)
+Application (flashing tool, terminal, ...)
+   │ opens COM11
+   ▼
+com0com pair  COM11 ↔ CNCB0        (or HW VSP3: COM10 → TCP)
+   ▼
+PC bridge: data, settings, DTR/RTS, BREAK → RFC2217
+   ▼ TCP
+ESP32 gateway library ── UART ──▶ target board
 ```
 
-Clients that already support TCP or RFC2217 can connect without a virtual COM driver. The PC gateway itself does not create a Windows COM device. It forwards the selected protocol; it does not convert raw TCP into RFC2217.
+## What it does
 
-ASR PRO is one proposed target example. Other UART targets can use the same PC transport when their protocol, electrical interface, and control requirements match. The simulator is an echo endpoint, not a target bootloader.
+**Desktop app (Windows, Python/Tk, Chinese and English).** One window with six tabs:
 
-## Quick start from source
+| Tab | Purpose |
+| --- | --- |
+| Connection / Advanced | Profiles with import and export, raw TCP or RFC2217, timeouts and buffer sizes. |
+| Status & traffic | Byte counters per direction, queue peaks, requested and confirmed serial settings, event log. |
+| Virtual COM | Detects HW VSP3 Single and com0com and shows what each can forward. Configures the HW VSP channel; creates and removes com0com pairs. Each change asks for one Windows administrator approval. |
+| com0com bridge | Connects the hidden end of a pair to an RFC2217 endpoint. Forwards baud and format changes made **after** the port is opened, plus DTR, RTS and BREAK. Ends the session when the application closes its port. |
+| ESP32 device | TCP reachability, an optional RFC2217 baud probe, the device's HTTP status, and a LAN scan for gateways. The token stays in memory only. |
 
-Run these commands in the repository root. Windows with Python 3.11 or newer is the build target; the previous local prototype used Python 3.14. Version-by-version validation of this alpha is pending. GUI use requires Tk support.
+A local echo simulator and a self-test cover the whole path without hardware. Every feature is also available from the command line.
+
+**ESP32 library (`arduino/`, Arduino-ESP32 2.x).** `SerialNetworkGateway` adds a maintenance mode to an existing firmware. While enabled it takes over one UART and forwards it over RFC2217; afterwards it gives the UART back. It uses bounded queues and reports faults instead of dropping data, accepts one client at a time, never carries data across sessions, supports a source IP allow-list and exits automatically after a timeout. Optional RESET and BOOT pins can be pulsed from your own authenticated code.
+
+A standalone ESP-IDF firmware in `firmware/` is kept as an alternative build.
+
+## Which virtual COM driver
+
+This project ships no kernel driver. It manages drivers you install yourself:
+
+| Measured on Windows 11 23H2 | HW VSP3 Single 3.1.2 | com0com 3.0.0.0 (signed) + this bridge |
+| --- | --- | --- |
+| Binary data, settings at open | yes | yes |
+| Baud change after open | 57600 and below only | yes, tested at 1.5 Mbaud |
+| Data bits / parity / stop change | only together with a baud change | yes |
+| DTR / RTS / BREAK | no | yes |
+| Session ends when the app closes the port | yes | yes, with close detection |
+
+Use **com0com** when the target needs reset lines or a baud switch during the session, as most bootloaders do. HW VSP is simpler when plain data at one fixed speed is enough.
+
+HW VSP also passes any Telnet option bytes the server sends unprompted to the application as serial data. The gateway therefore runs in quiet mode by default and only answers what the client asks.
+
+## Quick start
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe -m serial_gateway selftest --output artifacts/selftest.json
+.\.venv\Scripts\python.exe -m serial_gateway selftest
 .\.venv\Scripts\python.exe -m serial_gateway gui
 ```
 
-A successful self-test exits with code `0` and reports `"ok": true`. It creates temporary loopback endpoints and does not load a real-device profile or open a COM device. Follow the [reproducible PC simulation guide](docs/simulation.md) for raw TCP and RFC2217 client examples.
+Loop test with com0com and no hardware:
 
-The previous GUI prototype is Chinese. English GUI support is in progress; English documentation does not imply that every UI label has already been translated or reviewed. Opening the GUI does not start a connection. Start with the simulator before connecting a driver or device.
+1. In **Virtual COM**, click *Create pair…* (for example `COM11`) and approve the administrator prompt.
+2. In **Connection**, keep *Local simulator* and click *Start gateway*.
+3. In **com0com bridge**, choose the pair and click *Start bridge*. The target defaults to `127.0.0.1:7000`.
+4. Open `COM11` in any terminal. What you send comes back, and the gateway shows your serial settings and DTR/RTS.
 
-No downloadable binary, signed installer, or verified portable build is promised by this source quick start. Packaging acceptance is tracked separately.
-
-## Capabilities and limits
-
-| Area | PC implementation / boundary |
-| --- | --- |
-| Transport | Raw TCP and RFC2217 forwarding; RFC2217 observation for protocol statistics, without rewriting the forwarded stream. |
-| Local listener | Loopback only. Examples use `127.0.0.1`. One active client; concurrent clients are rejected. |
-| Buffering | Bounded application queues in both directions, backpressure, configurable chunk size and timeouts. Queue limits do not bound every operating-system or driver buffer. |
-| Sessions | Disconnect ends the session and discards pending application queues. No automatic replay or continuation. |
-| Profiles | JSON profiles, import/export in the GUI, schema validation, atomic saving. |
-| Diagnostics | Local simulation, byte/queue counters, observed serial requests and replies, read-only environment inspection. |
-| Virtual COM | External product required. The optional hub4com adapter uses an existing com0com pair; it does not install a driver. |
-| Firmware | Standalone ESP-IDF ESP32-S3 implementation in progress; build and hardware acceptance pending. |
-| Target programming | Application and target dependent. TCP delivery and RFC2217 replies do not prove successful programming or physical signal timing. |
-
-Raw TCP carries bytes only. Set UART parameters at the remote endpoint in advance. RFC2217 can negotiate serial settings only to the extent that the driver, remote implementation, and wiring support them. Simulator acceptance of DTR, RTS, BREAK, or a baud rate is not evidence that hardware can reproduce those settings.
+For a real device, point the bridge at the ESP32's address and port (default `3333`).
 
 ## Command line
 
-After activating the virtual environment, or using its Python executable explicitly:
-
 ```powershell
 python -m serial_gateway --help
-python -m serial_gateway --version
-python -m serial_gateway profiles
-python -m serial_gateway environment
-python -m serial_gateway selftest --bytes 65536 --output artifacts/selftest.json
+python -m serial_gateway vcom status
+python -m serial_gateway vcom create-pair --com COM11 --yes
+python -m serial_gateway bridge --endpoint CNCB0 --host 127.0.0.1 --port 7000
+python -m serial_gateway device check --host 192.168.50.20 --token-env GATEWAY_TOKEN
+python -m serial_gateway device scan
 python -m serial_gateway serve --simulate --port 7000
-python -m serial_gateway driver-help --protocol rfc2217 --port 7000
 ```
 
-`--config` is a global option placed before the subcommand. For example, `python -m serial_gateway --config local-profiles.json profiles` reads the configuration described in the [simulation guide](docs/simulation.md). `serve --duration 30` sets a bounded run time; `--port 0` requests a temporary local port.
+Commands that change the system require `--yes`. A token is read only from the environment variable named by `--token-env`.
 
-After a session ends, close the application's COM connection and clear the redirector's old session. In the GUI, explicitly rearm the gateway; in the CLI, start a new `serve` process. Check the final state and error fields as well as the process exit code.
+## Safety
 
-`environment` reads device metadata and installed-program registrations without opening a COM port. Its output can contain device identifiers and local paths; redact it before sharing.
+- 3.3 V logic only. Only one transmitter may drive a target's RX line, so disconnect or isolate an onboard USB-UART before wiring the ESP32 TX.
+- RFC2217 has no authentication. Keep the ESP32 on a trusted network and set its IP allow-list.
+- Diagnostics exports leave out tokens, payload bytes and installation paths.
 
 ## Documentation
 
 | Guide | Scope |
 | --- | --- |
-| [PC simulation](docs/simulation.md) | Source setup, deterministic profiles, binary echo checks, expected results. |
-| [Windows virtual COM](docs/windows-virtual-com.md) | HW VSP3 and com0com/hub4com options; driver acceptance procedure. |
-| [Remote endpoint contract](docs/remote-contract.md) | Raw/RFC2217 behavior, control settings, sessions, network boundaries. |
-| [Firmware build](docs/firmware.md) | Standalone ESP-IDF build prerequisites and evidence gate. |
-| [Hardware validation](docs/hardware-validation.md) | ESP32-S3 electrical checks, UART/control validation, ASR example gate. |
-| [Verification matrix](docs/verification.md) | Previous-prototype evidence, current pending checks, publication gate. |
+| [Windows virtual COM](docs/windows-virtual-com.md) | Driver setup, measured behaviour, close detection. |
+| [Remote endpoint contract](docs/remote-contract.md) | What the network side must implement. |
+| [PC simulation](docs/simulation.md) | Reproducible tests without hardware. |
+| [ESP32 library](arduino/README.md) | Wiring, API, embedding in an existing firmware. |
+| [ESP-IDF firmware](docs/firmware.md) | Alternative standalone build. |
+| [Hardware validation](docs/hardware-validation.md) | Steps before connecting a real target. |
+| [Verification matrix](docs/verification.md) | What has and has not been tested. |
 
-Every guide has a matching Simplified Chinese version linked at its top.
-
-## Development and release
+## Development
 
 ```powershell
 python -m pip install -e ".[dev]"
-python -m pytest -q
-python -m serial_gateway selftest --output artifacts/selftest.json
-python -m serial_gateway gui
+python -m pytest -q -W error::ResourceWarning
+python tools/check_public_tree.py
 ```
 
-Review both GUI languages and scaling before packaging. Record the exact source revision, Windows/Python versions, test results, and artifact checksums. Release binaries and public uploads require local acceptance of the scope actually claimed; unresolved driver or hardware rows must remain explicitly pending. See [CONTRIBUTING](CONTRIBUTING.md), [SECURITY](SECURITY.md), and the [changelog](CHANGELOG.md).
+See [CONTRIBUTING](CONTRIBUTING.md), [SECURITY](SECURITY.md) and the [changelog](CHANGELOG.md).
 
-## License and third-party software
+## License
 
-Original project code and documentation are licensed under [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution and dependency boundaries. pySerial is BSD-3-Clause; the `igrr/rfc2217-server` component is Apache-2.0. Virtual COM products are independent, separately obtained tools and are not bundled or relicensed by this project.
+Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The RFC2217 parser in `arduino/src/rfc2217/` and `firmware/` comes from [igrr/rfc2217-server](https://github.com/igrr/rfc2217-server) (Apache-2.0), with local changes listed in the source. pySerial is BSD-3-Clause. HW VSP3 and com0com are separate products and are not bundled.

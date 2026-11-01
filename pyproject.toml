@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serial-network-gateway"
-version = "0.2.0a1"
+version = "0.3.0a1"
 description = "Reusable TCP/RFC2217 serial gateway with bilingual desktop tools and ESP32 firmware"
 readme = "README.md"
 license = {text = "Apache-2.0"}
