@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serial-network-gateway"
-version = "0.3.0a1"
+version = "0.4.0"
 description = "Reusable TCP/RFC2217 serial gateway with bilingual desktop tools and ESP32 firmware"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -16,7 +16,7 @@ classifiers = [
   "Topic :: System :: Hardware :: Universal Serial Bus (USB) :: Serial",
 ]
 requires-python = ">=3.11"
-dependencies = ["pyserial==3.5"]
+dependencies = ["pyserial==3.5", "pystray==0.19.5; sys_platform == 'win32'", "Pillow>=10; sys_platform == 'win32'"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pyinstaller==6.20.0"]
@@ -35,3 +35,6 @@ include = ["serial_gateway*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
+
+[tool.setuptools.package-data]
+serial_gateway = ["assets/*.ico", "assets/*.png"]

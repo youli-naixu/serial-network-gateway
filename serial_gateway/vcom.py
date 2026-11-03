@@ -228,24 +228,39 @@ class Com0comBackend:
             return []
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command",
+             "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
              "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
              "Where-Object { $_.InstanceId -like 'COM0COM\\PORT\\CNC*' } | "
-             "ForEach-Object { $_.InstanceId + '|' + $_.FriendlyName }"],
-            capture_output=True, text=True, errors="replace", timeout=20, shell=False)
-        ends: dict[int, dict[str, str]] = {}
-        for line in result.stdout.splitlines():
-            match = re.match(r"COM0COM\\PORT\\CNC([AB])(\d+)\|.*?\((COM\d+|CNC[AB]\d+)\)", line.strip(), re.I)
-            if match:
-                side, number, name = match.group(1).upper(), int(match.group(2)), match.group(3).upper()
-                ends.setdefault(number, {})[side] = name
-        from .c0c_port import ri_wired_to_open
-        pairs = []
-        for number, sides in sorted(ends.items()):
-            app_name = sides.get("A", "")
-            endpoint = f"CNCB{number}"
-            pairs.append({"pair": number, "com": app_name if _COM_RE.fullmatch(app_name) else "",
-                          "endpoint": endpoint, "close_detect": ri_wired_to_open(endpoint)})
-        return pairs
+             "ForEach-Object { $_.InstanceId + '|' + $_.Class + '|' + $_.FriendlyName }"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=20, shell=False)
+        return parse_pnp_pairs(result.stdout)
+
+    def label_port(self, pair: int | None, label: str, com: str = "", timeout_s: float = 300.0) -> dict[str, Any]:
+        """Make the application end of a pair visible to normal COM pickers and name it.
+
+        ``pair=None`` installs a new pair. Either way the application end is
+        moved to the Windows Ports class (com0com ``PortName=COM#``), its
+        friendly name becomes ``<label> (COMn)``, and the hidden end reports
+        application open/close. One UAC prompt.
+        """
+        if not self.setupc:
+            raise RuntimeError("com0com is not installed.")
+        validate_label(label)
+        if com:
+            VcomPlan(com).validate()
+        if pair is not None and (not isinstance(pair, int) or not any(p["pair"] == pair for p in self.pairs())):
+            raise ValueError("Unknown pair number.")
+        job = {"backend": "com0com", "action": "label", "setupc": str(self.setupc),
+               "pair": pair, "com": com, "label": label}
+        try:
+            return run_elevated(job, timeout_s=timeout_s)
+        except TimeoutError:
+            # The helper's result can arrive late; the device tree tells whether the change landed.
+            done = next((p for p in self.pairs() if p.get("visible") and p.get("label") == label and p.get("com")), None)
+            if done is None:
+                raise
+            return {"ok": True, "action": "label", "pair": done["pair"], "com": done["com"], "label": label,
+                    "late": True}
 
     def create_pair(self, com: str, timeout_s: float = 120.0) -> dict[str, Any]:
         if not self.setupc:
@@ -274,6 +289,43 @@ class Com0comBackend:
             raise ValueError("Unknown pair number.")
         return run_elevated({"backend": "com0com", "action": "remove", "setupc": str(self.setupc), "pair": number},
                             timeout_s=timeout_s)
+
+
+_LABEL_RE = re.compile(r"[\w\u4e00-\u9fff][\w\u4e00-\u9fff .+-]{0,39}")
+
+
+def validate_label(label: str) -> str:
+    """Device names show up in every COM picker; keep them short and plain (no parentheses)."""
+    if not isinstance(label, str) or not _LABEL_RE.fullmatch(label) or label != label.strip():
+        raise ValueError("Port label: 1–40 letters, digits, CJK, space, dot, plus, minus or underscore.")
+    return label
+
+
+def parse_pnp_pairs(text: str) -> list[dict[str, Any]]:
+    """Pairs from ``InstanceId|Class|FriendlyName`` lines.
+
+    ``visible`` is true when the application end is in the Ports class, which
+    is what pyserial and most flashing tools enumerate; ports left in the
+    com0com CNCPorts class only open by name. ``label`` is the friendly name
+    without the trailing ``(COMn)``.
+    """
+    ends: dict[int, dict[str, str]] = {}
+    for line in text.splitlines():
+        match = re.match(r"COM0COM\\PORT\\CNC([AB])(\d+)\|([^|]*)\|(.*)\((COM\d+|CNC[AB]\d+)\)\s*$", line.strip(), re.I)
+        if match:
+            side, number = match.group(1).upper(), int(match.group(2))
+            ends.setdefault(number, {})[side] = {"class": match.group(3).strip(), "label": match.group(4).strip(),
+                                                 "name": match.group(5).upper()}
+    from .c0c_port import ri_wired_to_open
+    pairs = []
+    for number, sides in sorted(ends.items()):
+        app = sides.get("A", {})
+        app_name = app.get("name", "")
+        endpoint = f"CNCB{number}"
+        pairs.append({"pair": number, "com": app_name if _COM_RE.fullmatch(app_name) else "",
+                      "endpoint": endpoint, "close_detect": ri_wired_to_open(endpoint),
+                      "visible": app.get("class", "").lower() == "ports", "label": app.get("label", "")})
+    return pairs
 
 
 def detect_backends() -> list[BackendStatus]:
@@ -345,6 +397,92 @@ class _Done(Exception):
     """Internal: early successful exit from the elevated job."""
 
 
+def _setupc(setupc: Path, *args: str) -> str:
+    done = subprocess.run([str(setupc), *args], cwd=str(setupc.parent), capture_output=True, text=True,
+                          errors="replace", timeout=120, shell=False)
+    if done.returncode != 0:
+        raise RuntimeError(f"setupc {args[0]} failed")
+    return done.stdout
+
+
+def parse_setupc_list(text: str) -> dict[str, dict[str, str]]:
+    """``CNCA0 PortName=COM#,RealPortName=COM11`` lines -> {"CNCA0": {...}}."""
+    ports: dict[str, dict[str, str]] = {}
+    for line in text.splitlines():
+        match = re.match(r"(CNC[AB]\d+)\s+(\S.*)$", line.strip())
+        if match:
+            ports[match.group(1).upper()] = dict(
+                item.split("=", 1) for item in match.group(2).split(",") if "=" in item)
+    return ports
+
+
+def _set_friendly_name(instance_id: str, name: str) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class SP_DEVINFO_DATA(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("ClassGuid", ctypes.c_byte * 16),
+                    ("DevInst", wintypes.DWORD), ("Reserved", ctypes.c_void_p)]
+
+    setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+    setupapi.SetupDiCreateDeviceInfoList.restype = ctypes.c_void_p
+    setupapi.SetupDiCreateDeviceInfoList.argtypes = [ctypes.c_void_p, wintypes.HWND]
+    setupapi.SetupDiOpenDeviceInfoW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.HWND,
+                                                wintypes.DWORD, ctypes.POINTER(SP_DEVINFO_DATA)]
+    setupapi.SetupDiSetDeviceRegistryPropertyW.argtypes = [ctypes.c_void_p, ctypes.POINTER(SP_DEVINFO_DATA),
+                                                           wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+    handle = setupapi.SetupDiCreateDeviceInfoList(None, None)
+    if not handle or handle == ctypes.c_void_p(-1).value:
+        raise OSError("SetupDiCreateDeviceInfoList failed")
+    try:
+        data = SP_DEVINFO_DATA()
+        data.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
+        if not setupapi.SetupDiOpenDeviceInfoW(handle, instance_id, None, 0, ctypes.byref(data)):
+            raise OSError("device not found")
+        # Device Manager and pyserial show FRIENDLYNAME; Qt's QSerialPortInfo shows DEVICEDESC.
+        for prop, value in ((0x0C, name), (0x00, name.rsplit(" (", 1)[0])):  # SPDRP_FRIENDLYNAME, SPDRP_DEVICEDESC
+            buffer = ctypes.create_unicode_buffer(value)
+            if not setupapi.SetupDiSetDeviceRegistryPropertyW(handle, ctypes.byref(data), prop,
+                                                              buffer, ctypes.sizeof(buffer)):
+                raise OSError("SetupDiSetDeviceRegistryPropertyW failed")
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(handle)
+
+
+def _label_job(setupc: Path, job: dict[str, Any]) -> dict[str, Any]:
+    label = validate_label(str(job["label"]))
+    com = str(job.get("com") or "")
+    if com:
+        VcomPlan(com).validate()
+    pair = job.get("pair")
+    if pair is None:
+        before = set(parse_setupc_list(_setupc(setupc, "list")))
+        _setupc(setupc, "install", "PortName=COM#", "ri=ropen")
+        added = [name for name in parse_setupc_list(_setupc(setupc, "list"))
+                 if name not in before and name.startswith("CNCA")]
+        if not added:
+            raise RuntimeError("new pair not found")
+        number = int(added[0][4:])
+    else:
+        number = int(pair)
+        if not 0 <= number <= 255:
+            raise ValueError("Unexpected pair number.")
+        # Each change restarts the port device; skip the ones already in place.
+        current = parse_setupc_list(_setupc(setupc, "list"))
+        if current.get(f"CNCA{number}", {}).get("PortName") != "COM#":
+            _setupc(setupc, "change", f"CNCA{number}", "PortName=COM#")
+        if current.get(f"CNCB{number}", {}).get("RI", "").upper() != "ROPEN":
+            _setupc(setupc, "change", f"CNCB{number}", "ri=ropen")
+    if com:
+        _setupc(setupc, "change", f"CNCA{number}", f"RealPortName={com}")
+    real = parse_setupc_list(_setupc(setupc, "list")).get(f"CNCA{number}", {}).get("RealPortName", "")
+    if not _COM_RE.fullmatch(real):
+        raise RuntimeError("Ports class did not assign a COM name")
+    _set_friendly_name(f"COM0COM\\PORT\\CNCA{number}", f"{label} ({real})")
+    return {"ok": True, "action": "label", "pair": number, "com": real, "label": label}
+
+
 def _apply_job(job_path: str, result_path: str) -> int:
     """Elevated side. Accept only a fixed schema; never run arbitrary commands."""
     result: dict[str, Any] = {"ok": False}
@@ -370,6 +508,9 @@ def _apply_job(job_path: str, result_path: str) -> int:
                 if not 0 <= number <= 255:
                     raise ValueError("Unexpected pair number.")
                 argv = [str(setupc), "remove", str(number)]
+            elif action == "label":
+                result.update(_label_job(setupc, job))
+                raise _Done
             else:
                 raise ValueError("Unsupported com0com action.")
             done = subprocess.run(argv, cwd=str(setupc.parent), capture_output=True, text=True,

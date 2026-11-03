@@ -125,7 +125,7 @@ def test_run_background_posts_one_reply():
 def test_new_gui_strings_have_translations():
     import ast
     import re
-    for name in ("gui.py", "_gui_runtime.py"):
+    for name in ("gui.py", "_gui_runtime.py", "assistant.py"):
         path = os.path.join(os.path.dirname(rt.__file__), name)
         from pathlib import Path
         tree = ast.parse(Path(path).read_text(encoding="utf-8"))
@@ -170,13 +170,13 @@ def test_gui_constructs_and_switches_language(tmp_path):
     root.withdraw()
     try:
         app = _GatewayApp(root, str(tmp_path / "profiles.json"), "zh-CN")
-        assert app._notebook.index("end") == 6
+        assert app._notebook.index("end") == 4
         app._token_var.set(SECRET)
         bridge, worker = object(), app._worker
         app._bridge = None
         app._set_language("en")
         assert app._worker is worker and app._token_var.get() == SECRET
-        assert app._notebook.tab(2, "text") == "Virtual COM"
+        assert [app._notebook.tab(i, "text") for i in range(4)] == ["Gateway", "Virtual COM", "ESP32 device", "Diagnostics"]
         app._worker.submit("shutdown")
         del bridge
     finally:

@@ -28,7 +28,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from .c0c_port import LineSettings, PairEnd
 from .rfc2217 import (BINARY, COM_PORT_OPTION, DO, DONT, IAC, SGA, WILL, WONT,
@@ -61,8 +61,20 @@ class Com0comBridge:
     """Thread-based bridge. start() returns quickly; stop() joins all threads."""
 
     def __init__(self, endpoint: str, host: str, port: int, *, connect_timeout_s: float = 5.0,
-                 keepalive_s: int = 10, poll_s: float = 0.02, end_on_app_close: bool = True) -> None:
+                 keepalive_s: int = 10, poll_s: float = 0.02, end_on_app_close: bool = True,
+                 connect_on_app_open: bool = False,
+                 before_connect: Callable[[], None] | None = None,
+                 connect_retry_s: float = 0.0) -> None:
+        """``connect_on_app_open`` delays the TCP connection until the application
+        opens the COM port (needs close detection, ``ri=ropen``); bytes it writes
+        meanwhile wait in the com0com buffer. ``before_connect`` runs right before
+        connecting, e.g. to put the device into maintenance mode; an exception
+        ends the session. ``connect_retry_s`` keeps retrying a refused connection
+        for that long, for devices that open their listener on demand."""
         self.end_on_app_close = end_on_app_close
+        self.connect_on_app_open = connect_on_app_open
+        self.before_connect = before_connect
+        self.connect_retry_s = connect_retry_s
         if not endpoint.startswith("CNCB") or not endpoint[4:].isdigit():
             raise ValueError("Endpoint must be the hidden CNCBn end of a com0com pair.")
         if not isinstance(port, int) or not 1 <= port <= 65535:
@@ -186,10 +198,30 @@ class Com0comBridge:
     def _run(self) -> None:
         try:
             self._pair = PairEnd(self.endpoint)
+            if self.connect_on_app_open:
+                if not self._pair.open_wired:
+                    raise RuntimeError("connect_on_app_open needs close detection (ri=ropen) on the pair")
+                with self._lock:
+                    self._stats.state = "waiting_app"
+                self._event("info", f"Opened {self.endpoint}; waiting for the application to open the COM port.")
+                while not self._stop.is_set() and not self._pair.app_open():
+                    time.sleep(0.01)
+                if self._stop.is_set():
+                    return
             with self._lock:
                 self._stats.state = "connecting"
-            self._event("info", f"Opened {self.endpoint}; connecting to {self.host}:{self.port}.")
-            sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout_s)
+            if self.before_connect is not None:
+                self.before_connect()
+            self._event("info", f"Connecting to {self.host}:{self.port}.")
+            deadline = time.monotonic() + self.connect_retry_s
+            while True:
+                try:
+                    sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout_s)
+                    break
+                except ConnectionRefusedError:
+                    if self._stop.is_set() or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.1)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             if hasattr(socket, "SIO_KEEPALIVE_VALS"):

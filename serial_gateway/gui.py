@@ -27,7 +27,7 @@ from .models import GatewayProfile
 from .profiles import ProfileStore
 
 
-_TITLE = "串口网络网关"
+_TITLE = "高级工具 · 串口网络网关"
 _MODES = {"本机模拟": "simulator", "远端设备": "device"}
 _PROTOCOLS = {"RFC2217": "rfc2217", "原始 TCP": "raw"}
 _STATES = {
@@ -220,8 +220,11 @@ class _ScrollablePage(ttk.Frame):
 
 
 class _GatewayApp:
-    def __init__(self, root: tk.Tk, config_path: str | None, language: str | None = None) -> None:
+    def __init__(self, root: tk.Misc, config_path: str | None, language: str | None = None,
+                 on_closed: Any = None) -> None:
+        """``root`` may be a Toplevel; ``on_closed`` runs after the window is destroyed."""
         self.root = root
+        self._on_closed = on_closed
         self._t = Translator(language)
         self._language_var = tk.StringVar(root, LANGUAGES[self._t.language])
         self._messagebox = _Dialogs(self, messagebox)
@@ -452,8 +455,6 @@ class _GatewayApp:
         language_box.grid(row=0, column=2, sticky="e")
         language_box.bind("<<ComboboxSelected>>", self._change_language)
         ttk.Button(header, text=self._t("使用说明"), command=self._open_help).grid(row=0, column=3, padx=(8, 0))
-        self._diagnostic_button = ttk.Button(header, text=self._t("导出诊断"), command=self._export_diagnostics)
-        self._diagnostic_button.grid(row=0, column=4, padx=(8, 0))
 
         profiles = ttk.Frame(outer)
         profiles.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -484,17 +485,23 @@ class _GatewayApp:
 
         self._notebook = ttk.Notebook(outer)
         self._notebook.grid(row=3, column=0, sticky="nsew")
-        pages = [_ScrollablePage(self._notebook) for _ in range(6)]
-        (self._basic_tab, self._stats_tab, self._vcom_tab, self._bridge_tab,
-         self._device_tab, self._advanced_tab) = [page.content for page in pages]
-        for page, label in zip(pages, ("基本配置", "连接与统计", "虚拟 COM", "com0com 桥接", "ESP32 设备", "高级参数")):
+        pages = [_ScrollablePage(self._notebook) for _ in range(4)]
+        gateway_page, vcom_page, device_page, diag_page = [page.content for page in pages]
+        for page, label in zip(pages, ("网关", "虚拟串口", "ESP32 设备", "诊断")):
             self._notebook.add(page, text=self._t(label))
+        # Each builder lays out its own frame from row 0; the pages stack those frames.
+        self._basic_tab, self._stats_tab, self._advanced_tab = self._sections(
+            gateway_page, ("连接设置", "运行状态与流量", "高级参数"))
+        self._vcom_tab, self._bridge_tab = self._sections(vcom_page, ("虚拟串口驱动", "com0com 桥接"))
+        self._device_tab, = self._sections(device_page, (None,))
+        self._diag_tab, = self._sections(diag_page, (None,))
         self._build_basic()
         self._build_statistics()
+        self._build_advanced()
         self._build_virtual_com()
         self._build_bridge()
         self._build_device()
-        self._build_advanced()
+        self._build_diagnostics()
         for page in pages:
             page.bind_navigation()
 
@@ -515,7 +522,7 @@ class _GatewayApp:
         footer = ttk.Frame(outer)
         footer.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         footer.columnconfigure(0, weight=1)
-        self._wrap(ttk.Label(footer, text=self._t("真实硬件未验证 · 串口参数显示不代表硬件实测"), style="Muted.TLabel", font=(self._font_family, 9))).grid(row=0, column=0, sticky="ew")
+        self._wrap(ttk.Label(footer, text=self._t("高级工具：通用串口网关、虚拟串口驱动管理、ESP32 检测与诊断。日常烧录用主窗口即可。"), style="Muted.TLabel", font=(self._font_family, 9))).grid(row=0, column=0, sticky="ew")
         self._wrap(ttk.Label(footer, textvariable=self._task_text, style="Muted.TLabel", font=(self._font_family, 9))).grid(row=1, column=0, sticky="ew")
 
     def _field(self, parent: ttk.Frame, row: int, column: int, title: str, key: str,
@@ -533,6 +540,35 @@ class _GatewayApp:
         widget.grid(row=1, column=0, sticky="ew")
         self._editable.append((widget, kind))
         return widget
+
+    def _sections(self, page: ttk.Frame, titles: tuple[str | None, ...]) -> list[ttk.Frame]:
+        page.columnconfigure(0, weight=1)
+        frames, row = [], 0
+        for index, title in enumerate(titles):
+            if title:
+                ttk.Label(page, text=self._t(title), style="Heading.TLabel").grid(
+                    row=row, column=0, sticky="w", pady=(0 if index == 0 else 18, 6))
+                row += 1
+            frame = ttk.Frame(page, style="Card.TFrame")
+            frame.grid(row=row, column=0, sticky="nsew")
+            frames.append(frame)
+            row += 1
+        return frames
+
+    def _build_diagnostics(self) -> None:
+        tab = self._diag_tab
+        tab.columnconfigure(0, weight=1)
+        self._wrap(ttk.Label(tab, text=self._t("环境检查只列出本机串口和驱动信息，不会打开串口；自检使用独立的临时本机模拟，不会连接真实设备。导出诊断时会去掉令牌、路径和串口数据。"), style="CardMuted.TLabel"), 140).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        buttons = ttk.Frame(tab, style="Card.TFrame")
+        buttons.grid(row=1, column=0, sticky="w", pady=(0, 8))
+        self._environment_button = ttk.Button(buttons, text=self._t("检查本机环境"), command=lambda: self._run_check("environment"))
+        self._environment_button.grid(row=0, column=0, sticky="w")
+        self._selftest_button = ttk.Button(buttons, text=self._t("运行自检"), command=lambda: self._run_check("selftest"))
+        self._selftest_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self._diagnostic_button = ttk.Button(buttons, text=self._t("导出诊断"), command=self._export_diagnostics)
+        self._diagnostic_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self._checks_text = self._readonly_text(tab, row=2, height=14)
+        self._render_checks()
 
     def _build_basic(self) -> None:
         tab = self._basic_tab
@@ -762,17 +798,7 @@ class _GatewayApp:
         ttk.Label(endpoint, textvariable=self._vcom_endpoint, style="Card.TLabel").grid(row=0, column=0, sticky="w")
         self._copy_endpoint_button = ttk.Button(endpoint, text=self._t("复制入口"), command=self._copy_endpoint)
         self._copy_endpoint_button.grid(row=0, column=1, sticky="e")
-        self._wrap(ttk.Label(tab, text=self._t("驱动由用户自行安装（厂商签名）；本程序只读取状态，修改通道或端口对时弹出一次 Windows 管理员确认。环境检查只列出信息，不会打开 COM。"), style="CardMuted.TLabel")).grid(row=9, column=0, sticky="w", pady=(0, 8))
-        buttons = ttk.Frame(tab, style="Card.TFrame")
-        buttons.grid(row=10, column=0, sticky="ew", pady=(0, 8))
-        buttons.columnconfigure(2, weight=1)
-        self._environment_button = ttk.Button(buttons, text=self._t("检查本机环境"), command=lambda: self._run_check("environment"))
-        self._environment_button.grid(row=0, column=0, sticky="w")
-        self._selftest_button = ttk.Button(buttons, text=self._t("运行自检"), command=lambda: self._run_check("selftest"))
-        self._selftest_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
-        self._wrap(ttk.Label(buttons, text=self._t("自检使用独立临时本机模拟"), style="CardMuted.TLabel")).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        self._checks_text = self._readonly_text(tab, row=11, height=5)
-        self._render_checks()
+        self._wrap(ttk.Label(tab, text=self._t("驱动由用户自行安装（厂商签名）；本程序只读取状态，修改通道或端口对时弹出一次 Windows 管理员确认。"), style="CardMuted.TLabel")).grid(row=9, column=0, sticky="w", pady=(0, 8))
         self._render_vcom()
 
     def _backend(self, name: str) -> dict[str, Any] | None:
@@ -1668,6 +1694,8 @@ class _GatewayApp:
         if self._closing:
             if self._shutdown_complete and not self._aux_pending and "bridge_shutdown" not in self._ext_pending:
                 self.root.destroy()
+                if self._on_closed is not None:
+                    self._on_closed()
                 return
             if time.monotonic() >= self._close_deadline and not self._close_warning_shown:
                 self._close_warning_shown = True

@@ -4,6 +4,55 @@ Only presentation text belongs here; profile names and protocol values are data.
 """
 
 EN = {
+    '一键无线烧录': 'Wireless flashing',
+    '设置': 'Settings',
+    '启动': 'Start',
+    '保存设置': 'Save settings',
+    '正在查找烧录用虚拟 COM': 'Looking for the flashing COM port',
+    '正在准备烧录用虚拟 COM': 'Preparing the flashing COM port',
+    '正在停止无线烧录': 'Stopping wireless flashing',
+    '完成（烧录软件已关闭端口）': 'Done (the flashing tool closed the port)',
+    '烧录软件打开后没有发送数据就关闭了': 'The flashing tool closed the port without sending data',
+    '目标未进入下载模式，可手动给它重新上电': 'Target did not enter download mode; power-cycle it by hand',
+    '就绪：等待烧录软件打开 {com}': 'Ready: waiting for the flashing tool to open {com}',
+    '正在让目标进入下载模式…': 'Putting the target into download mode…',
+    '正在烧录…': 'Flashing…',
+    '出错，3 秒后重试': 'Error; retrying in 3 s',
+    '将准备一个名为“{label}”的虚拟 COM（优先改造已有的 com0com 端口对，否则新建一对），让天问Block等软件能在串口列表里看到它。\n\n确定后 Windows 会弹出一次管理员确认，最长约 2 分钟。': 'A virtual COM named "{label}" will be prepared (reusing an existing com0com pair if there is one, otherwise creating one) so tools such as TianwenBlock list it.\n\nWindows will ask once for administrator approval; this can take up to 2 minutes.',
+    '进入下载模式': 'Download mode',
+    '上次烧录': 'Last download',
+    '本次数据': 'Traffic',
+    '虚拟 COM 备注名': 'Virtual COM label',
+    'ESP32 地址': 'ESP32 address',
+    'ESP32 端口': 'ESP32 port',
+    '令牌环境变量名（可选）': 'Token environment variable (optional)',
+    '无法启动': 'Cannot start',
+    '请先填写 ESP32 地址。': 'Enter the ESP32 address first.',
+    '未找到 com0com。请先安装官方签名版 com0com。': 'com0com was not found. Install the signed com0com build first.',
+    '请先停止': 'Stop first',
+    '正在运行时不能重新准备虚拟 COM，请先点“停止”。': 'The virtual COM cannot be prepared while running; click "Stop" first.',
+    '重新准备虚拟 COM（需要管理员确认）': 'Prepare virtual COM again (administrator approval)',
+    'ESP32 端口应为整数。': 'ESP32 port must be an integer.',
+    '设置无法保存': 'Settings not saved',
+    '设置有误': 'Invalid settings',
+    '准备虚拟 COM': 'Prepare virtual COM',
+    '正在等待管理员确认并准备虚拟 COM…': 'Waiting for administrator approval to prepare the virtual COM…',
+    '{com}（{label}）— 在烧录软件里选这个': '{com} ({label}) — choose this one in the flashing tool',
+    '第 {n} 次：{result}': '#{n}: {result}',
+    '发出 {sent} B · 收到 {received} B': 'Sent {sent} B · received {received} B',
+    '查找虚拟 COM 失败：{error}': 'Looking for the virtual COM failed: {error}',
+    '正在查找…': 'Looking…',
+    '尚未准备；点“启动”会先准备一个': 'Not prepared yet; "Start" prepares one first',
+    '目标程序已应答': 'Target firmware answered',
+    '目标程序未应答': 'Target firmware did not answer',
+    '进入下载模式的地址（留空 = http://ESP32地址/api/maintenance/enter?mode=isp）': 'Enter-download-mode URL (empty = http://<ESP32 address>/api/maintenance/enter?mode=isp)',
+    '打开本程序时自动启动': 'Start automatically when this program opens',
+    '准备虚拟 COM 失败：{error}': 'Preparing the virtual COM failed: {error}',
+    '未找到 com0com': 'com0com not found',
+    '已进入下载模式（{ms} ms）': 'In download mode ({ms} ms)',
+    '未进入下载模式': 'Not in download mode',
+    '启动后本程序会准备一个带备注的虚拟 COM。在天问Block等烧录软件里选择它，点下载即可经 ESP32 无线烧录；每次烧录前自动让目标进入下载模式，烧完自动等待下一次。': 'Once started, this program prepares a labelled virtual COM. Choose it in TianwenBlock or another flashing tool and click download to flash wirelessly through the ESP32. Before each download the target is put into download mode; afterwards the station waits for the next one.',
+    '需要已安装的 com0com（签名驱动）。第一次使用或改了备注名时，Windows 会弹出一次管理员确认；之后打开程序直接可用。令牌只从环境变量读取，不会保存。': 'Requires the signed com0com driver. The first time, or after changing the label, Windows asks once for administrator approval; after that it works as soon as the program opens. Tokens are only read from an environment variable and never saved.',
     '启用关闭检测': 'Enable close detection',
     '正在配置关闭检测': 'Configuring close detection',
     '无法启用关闭检测': 'Cannot enable close detection',
@@ -525,3 +574,7 @@ HELP_EN = (
     "The Virtual COM tab reads installed HW VSP3 Single and com0com. Writing the HW VSP channel, or creating or removing a com0com port pair, each shows one Windows administrator prompt; this app installs no drivers. HW VSP does not forward DTR/RTS and cannot switch above 57600 baud after opening; use the com0com bridge tab when you need these. After a bridge session ends, click Restart. The ESP32 device tab runs read-only TCP, optional baud probe and HTTP status checks; the token and header name stay in memory only."
 )
 EN[HELP_ZH] = HELP_EN
+
+from .locales_assistant import EN_ASSISTANT  # noqa: E402
+
+EN.update(EN_ASSISTANT)

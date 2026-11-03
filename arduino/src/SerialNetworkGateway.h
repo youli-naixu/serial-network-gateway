@@ -42,6 +42,15 @@ struct SerialNetworkGatewayConfig {
     // UART frame/parity/break events: count only (false) or close the session.
     bool faultOnLineError = false;
 
+    // Optional target preparation run once per session after the UART driver is
+    // installed (defaultBaud, configured pins) and before any client byte or
+    // command reaches the UART. Runs in the gateway's UART task; client traffic
+    // is queued meanwhile, so keep it short and within queueDepth blocks. The
+    // gateway restores the configured pins and defaultBaud afterwards and drops
+    // whatever the hook left in the RX buffer. A false return is counted in
+    // hookFailures; the session continues.
+    std::function<bool(int uartNum)> sessionStartHook;
+
     // Optional source IPv4 allow-list. Count 0 = accept any source.
     static constexpr uint8_t kMaxAllowedIps = 4;
     IPAddress allowedIps[kMaxAllowedIps];
@@ -80,6 +89,8 @@ struct SerialNetworkGatewayStatus {
     bool rts;
     bool breakOn;                // TX held at space by a client BREAK request
     uint32_t ignoredControls;    // DTR/RTS "on" requests for unconfigured pins
+    uint32_t hookRuns;           // sessionStartHook calls since begin()
+    uint32_t hookFailures;       // of which returned false
     bool quietMode;
     uint16_t tcpPort;
     uint32_t maintenanceRemainingMs; // 0 when disabled, timer off, or connected

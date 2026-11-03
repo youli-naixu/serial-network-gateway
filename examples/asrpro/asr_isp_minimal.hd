@@ -1,0 +1,94 @@
+#include "asr.h"
+extern "C"{ void * __dso_handle = 0 ;}
+extern "C" void dpmu_software_reset_system_config(void);
+extern "C" uint32_t prompt_is_playing();
+#include "setup.h"
+#include "HardwareSerial.h"
+#include "myLib/asr_event.h"
+#include <string.h>
+
+// SPDX-License-Identifier: Apache-2.0
+// Minimal ASR PRO program for wireless flashing (TianwenBlock code mode).
+// Serial2 on PA5 (TX) / PA6 (RX), 9600 baud, talks to the ESP32. When the
+// ESP32 sends "<asr_isp>", the ASR replies "<asr_isp:ok>", says a prompt and
+// soft-resets into the ROM bootloader, where the ESP32 catches it.
+// Wake word "天问五幺"; command "测试一下" proves the program is running.
+
+uint32_t snid;
+void ASR_CODE();
+void app();
+
+//{speak:小蝶-清新女声,vol:10,speed:10,platform:haohaodada}
+//{playid:10001,voice:欢迎使用语音助手，用天问五幺唤醒我。}
+//{playid:10002,voice:我退下了，用天问五幺唤醒我}
+//{playid:10500,voice:收到烧录命令，正在重启进入下载模式}
+
+static const uint16_t AUDIO_ISP = 10500;
+static char rx_buf[24];
+static uint8_t rx_len = 0;
+static bool rx_active = false;
+
+static void enter_download_mode() {
+  Serial2.print("<asr_isp:ok>");   // reply first: the ESP32 waits up to 300 ms for it
+  play_audio(AUDIO_ISP);
+  for (int waited = 0; waited < 5000 && prompt_is_playing(); waited += 20) {
+    delay(20);
+  }
+  delay(30);
+  dpmu_software_reset_system_config();
+}
+
+static void handle_frame(const char *payload) {
+  if (strcmp(payload, "asr_isp") == 0) {
+    enter_download_mode();
+  }
+}
+
+static void poll_esp32() {
+  while (Serial2.available()) {
+    char ch = (char)Serial2.read();
+    if (ch == '<') {
+      rx_active = true;
+      rx_len = 0;
+    } else if (ch == '>' && rx_active) {
+      rx_buf[rx_len] = '\0';
+      rx_active = false;
+      handle_frame(rx_buf);
+    } else if (rx_active) {
+      if (rx_len < sizeof(rx_buf) - 1) {
+        rx_buf[rx_len++] = ch;
+      } else {
+        rx_active = false;
+      }
+    }
+  }
+}
+
+void ASR_CODE(){
+  // snid 1 = "测试一下"; its reply text is played automatically.
+}
+
+void app(){
+  while (1) {
+    poll_esp32();
+    delay(20);
+  }
+  vTaskDelete(NULL);
+}
+
+void hardware_init(){
+  vol_set(5);
+  xTaskCreate(app,"app",256,NULL,4,NULL);
+  vTaskDelete(NULL);
+}
+
+void setup()
+{
+  //{ID:0,keyword:"唤醒词",ASR:"天问五幺",ASRTO:"我在呢"}
+  //{ID:1,keyword:"命令词",ASR:"测试一下",ASRTO:"程序运行正常"}
+  setPinFun(5,FORTH_FUNCTION);
+  setPinFun(6,FORTH_FUNCTION);
+  Serial2.begin(9600);
+}
+
+/** edittype="asr_procode" */

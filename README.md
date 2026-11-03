@@ -1,39 +1,48 @@
-# Serial Network Gateway
+# ASR Wireless Flash Assistant · Serial Network Gateway
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Use a serial port over the network. A Windows application opens an ordinary `COMx` port; the bytes, serial settings and control lines travel over TCP/RFC2217 to an ESP32, which drives a real UART. The project is generic: it was started to flash a voice module wirelessly, but nothing in the data path is target specific.
-
-**Status: `0.3.0-alpha`. The PC side has been tested end to end with real virtual COM drivers on Windows 11. The ESP32 library compiles but has not yet run on hardware.** See the [verification matrix](docs/verification.md).
+Flash an ASR PRO voice module over Wi-Fi through an ESP32, without a USB cable: open the vendor's tool (TianwenBlock) on your PC and click Download.
 
 ```text
-Application (flashing tool, terminal, ...)
-   │ opens COM11
-   ▼
-com0com pair  COM11 ↔ CNCB0        (or HW VSP3: COM10 → TCP)
-   ▼
-PC bridge: data, settings, DTR/RTS, BREAK → RFC2217
-   ▼ TCP
-ESP32 gateway library ── UART ──▶ target board
+TianwenBlock ── choose "ASR 无线烧录 (COMn)" ──▶ this program ── Wi-Fi ──▶ ESP32 ──▶ ASR PRO download port
 ```
 
-## What it does
+**Status: `0.4.0`.** Tested on Windows 11 + ESP32-S3 + ASRPRO-4M: a full 1.7 MB firmware downloads wirelessly in about 50 seconds, repeatedly. See the [verification matrix](docs/verification.md).
 
-**Desktop app (Windows, Python/Tk, Chinese and English).** One window with six tabs:
+## Three steps
+
+1. **Wire it**: ESP32 GPIO9→ASR PB6, GPIO10←PB5 (download port); GPIO2→PA6, GPIO1←PA5 (application UART); common ground. Unplug the ASR's USB while flashing. See [Wiring](docs/wiring.md).
+2. **Install**:
+   - Flash [`arduino/examples/AsrWirelessFlash`](arduino/examples/AsrWirelessFlash/AsrWirelessFlash.ino) to the ESP32 (set your Wi-Fi name and password).
+   - Over USB, put a program with the restart command on the ASR once: the [minimal project](examples/asrpro/asr_isp_minimal.hd), or add the [snippet](examples/asrpro/asr_isp_snippet.cpp) to your own.
+   - Install the [signed com0com](https://sourceforge.net/projects/com0com/files/com0com/3.0.0.0/) (`com0com-3.0.0.0-i386-and-x64-signed.zip`) on the PC.
+3. **Flash**: download `ASR 无线烧录助手` from [Releases](https://github.com/youli-naixu/serial-network-gateway/releases) and open it. The first time, enter the ESP32 address and click "Prepare virtual COM" (one administrator prompt). Then choose **ASR 无线烧录 (COMn)** in TianwenBlock and click Download.
+
+The window is a single page: a status light, the port to choose, a checklist (anything not ready turns red with a fix button) and a download history. Closing the window keeps it waiting in the tray; run-at-sign-in is off by default and can be turned on in Settings.
+
+## How it works
+
+For about 850 ms after power-up the ASR PRO enters download mode only if its download port receives sync bytes and a handshake. The official USB board creates that moment by power-cycling the chip through transistors driven by DTR/RTS. Wi-Fi has no such lines, so:
+
+1. When the flashing tool opens the virtual COM, this program asks the ESP32 to prepare the target.
+2. The ESP32 sends `<asr_isp>` on the application UART; the ASR program replies and soft-resets, and the ESP32 catches the bootloader on the download port (about 135 ms measured).
+3. Once caught the bootloader waits; this program relays the tool's data and baud changes (115200→750000→1500000) to the ESP32 over RFC2217.
+
+On the PC, [com0com](docs/wiring.md) provides a pair of virtual ports: one end for TianwenBlock, the other read by this program. Protocol details (frames, CRC, the two stages) are in [docs/asrpro-download-protocol.md](docs/asrpro-download-protocol.md).
+
+## Advanced tools
+
+"Advanced tools" in the main window opens the general-purpose features; the project also works for other "serial over the network" uses:
 
 | Tab | Purpose |
 | --- | --- |
-| Connection / Advanced | Profiles with import and export, raw TCP or RFC2217, timeouts and buffer sizes. |
-| Status & traffic | Byte counters per direction, queue peaks, requested and confirmed serial settings, event log. |
-| Virtual COM | Detects HW VSP3 Single and com0com and shows what each can forward. Configures the HW VSP channel; creates and removes com0com pairs. Each change asks for one Windows administrator approval. |
-| com0com bridge | Connects the hidden end of a pair to an RFC2217 endpoint. Forwards baud and format changes made **after** the port is opened, plus DTR, RTS and BREAK. Ends the session when the application closes its port. |
-| ESP32 device | TCP reachability, an optional RFC2217 baud probe, the device's HTTP status, and a LAN scan for gateways. The token stays in memory only. |
+| Gateway | Profiles, raw TCP or RFC2217, timeouts and buffers; byte counters and event log. |
+| Virtual COM | Detect HW VSP3 Single and com0com, create and remove com0com pairs; bridge com0com to any RFC2217 endpoint. |
+| ESP32 device | TCP reachability, optional baud probe, device HTTP status, LAN scan. |
+| Diagnostics | Local environment check, offline self-test, sanitised diagnostics export. |
 
-A local echo simulator and a self-test cover the whole path without hardware. Every feature is also available from the command line.
-
-**ESP32 library (`arduino/`, Arduino-ESP32 2.x).** `SerialNetworkGateway` adds a maintenance mode to an existing firmware. While enabled it takes over one UART and forwards it over RFC2217; afterwards it gives the UART back. It uses bounded queues and reports faults instead of dropping data, accepts one client at a time, never carries data across sessions, supports a source IP allow-list and exits automatically after a timeout. Optional RESET and BOOT pins can be pulsed from your own authenticated code.
-
-A standalone ESP-IDF firmware in `firmware/` is kept as an alternative build.
+**ESP32 library (`arduino/`, Arduino-ESP32 2.x)**: `SerialNetworkGateway` adds a "maintenance mode" to existing firmware: while active it owns one UART and relays it over RFC2217, then hands it back. `firmware/` keeps a standalone ESP-IDF firmware as an alternative.
 
 ## Which virtual COM driver
 
@@ -51,20 +60,21 @@ Use **com0com** when the target needs reset lines or a baud switch during the se
 
 HW VSP also passes any Telnet option bytes the server sends unprompted to the application as serial data. The gateway therefore runs in quiet mode by default and only answers what the client asks.
 
-## Quick start
+## Run from source
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m serial_gateway            # ASR Wireless Flash Assistant
+.\.venv\Scripts\python.exe -m serial_gateway gui        # Advanced tools
 .\.venv\Scripts\python.exe -m serial_gateway selftest
-.\.venv\Scripts\python.exe -m serial_gateway gui
 ```
 
 Loop test with com0com and no hardware:
 
-1. In **Virtual COM**, click *Create pair…* (for example `COM11`) and approve the administrator prompt.
-2. In **Connection**, keep *Local simulator* and click *Start gateway*.
-3. In **com0com bridge**, choose the pair and click *Start bridge*. The target defaults to `127.0.0.1:7000`.
+1. In Advanced tools, **Virtual COM** tab, click *Create pair…* (for example `COM11`) and approve the administrator prompt.
+2. In **Gateway**, keep *Local simulator* and click *Start gateway*.
+3. Further down the **Virtual COM** tab, in the com0com bridge, choose the pair and click *Start bridge*. The target defaults to `127.0.0.1:7000`.
 4. Open `COM11` in any terminal. What you send comes back, and the gateway shows your serial settings and DTR/RTS.
 
 For a real device, point the bridge at the ESP32's address and port (default `3333`).
@@ -73,6 +83,9 @@ For a real device, point the bridge at the ESP32's address and port (default `33
 
 ```powershell
 python -m serial_gateway --help
+python -m serial_gateway station config --host 192.168.50.20
+python -m serial_gateway station prepare --yes
+python -m serial_gateway station run
 python -m serial_gateway vcom status
 python -m serial_gateway vcom create-pair --com COM11 --yes
 python -m serial_gateway bridge --endpoint CNCB0 --host 127.0.0.1 --port 7000
@@ -93,6 +106,9 @@ Commands that change the system require `--yes`. A token is read only from the e
 
 | Guide | Scope |
 | --- | --- |
+| [Wiring](docs/wiring.md) | How to wire the ESP32 to the ASR PRO and what wrong wiring looks like. |
+| [Examples](examples/README.md) | ESP32 sketch, ASR snippet and minimal project. |
+| [ASR download protocol](docs/asrpro-download-protocol.md) | Frame format and sequence of the official tool (from captures). |
 | [Windows virtual COM](docs/windows-virtual-com.md) | Driver setup, measured behaviour, close detection. |
 | [Remote endpoint contract](docs/remote-contract.md) | What the network side must implement. |
 | [PC simulation](docs/simulation.md) | Reproducible tests without hardware. |

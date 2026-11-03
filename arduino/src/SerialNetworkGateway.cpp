@@ -153,6 +153,7 @@ struct SerialNetworkGateway::Impl {
     std::atomic<uint8_t> bits{8}, parity{1}, stops{1};
     std::atomic<bool> dtr{false}, rts{false}, breakOn{false};
     std::atomic<uint32_t> unsupportedControls{0};
+    std::atomic<uint32_t> hookRuns{0}, hookFailures{0};
 
     std::atomic<uint32_t> tcpRx{0}, uartTx{0}, uartRx{0}, tcpTx{0};
     std::atomic<uint32_t> toUartPeak{0}, toNetPeak{0};
@@ -271,6 +272,16 @@ struct SerialNetworkGateway::Impl {
             return false;
         }
         xQueueReset(uartEvents);
+        if (cfg.sessionStartHook) {
+            hookRuns.fetch_add(1);
+            bool ok = cfg.sessionStartHook(cfg.uartNum);
+            if (!ok) { hookFailures.fetch_add(1); log_w("sessionStartHook returned false"); }
+            uart_set_pin(port(), cfg.txPin, cfg.rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+            uart_set_baudrate(port(), cfg.defaultBaud);
+            uart_wait_tx_done(port(), pdMS_TO_TICKS(100));
+            uart_flush_input(port());
+            xQueueReset(uartEvents);
+        }
         uartReady.store(true);
         return true;
     }
@@ -797,6 +808,7 @@ SerialNetworkGateway::Error SerialNetworkGateway::begin()
     s.baud.store(s.cfg.defaultBaud);
     s.bits.store(8); s.parity.store(1); s.stops.store(1);
     s.rejected.store(0);
+    s.hookRuns.store(0); s.hookFailures.store(0);
 
     struct TaskDef { TaskFunction_t fn; const char *name; uint32_t stack; UBaseType_t prio; EventBits_t exitBit; };
     const TaskDef defs[] = {
@@ -964,6 +976,8 @@ SerialNetworkGatewayStatus SerialNetworkGateway::status() const
     st.rts = s.rts.load();
     st.breakOn = s.breakOn.load();
     st.ignoredControls = s.unsupportedControls.load();
+    st.hookRuns = s.hookRuns.load();
+    st.hookFailures = s.hookFailures.load();
     st.quietMode = s.cfg.quietMode;
     st.tcpPort = s.cfg.tcpPort;
     st.maintenanceRemainingMs = 0;
@@ -989,6 +1003,7 @@ String SerialNetworkGateway::statusJson() const
              "\"sessionFault\":\"%s\",\"lastFault\":\"%s\",\"rejected\":%u,\"lineErrors\":%u,"
              "\"serial\":{\"baud\":%u,\"dataBits\":%u,\"parity\":\"%c\",\"stopBits\":\"%s\","
              "\"dtr\":%s,\"rts\":%s,\"break\":%s},\"ignoredControls\":%u,"
+             "\"hookRuns\":%u,\"hookFailures\":%u,"
              "\"quiet\":%s,\"port\":%u,\"maintenanceRemainingMs\":%u}",
              st.stateName, ip, (unsigned)st.session,
              (unsigned)st.tcpRxBytes, (unsigned)st.uartTxBytes, (unsigned)st.uartRxBytes, (unsigned)st.tcpTxBytes,
@@ -996,7 +1011,7 @@ String SerialNetworkGateway::statusJson() const
              st.sessionFault, st.lastFault, (unsigned)st.rejectedConnections, (unsigned)st.lineErrors,
              (unsigned)st.baud, (unsigned)st.dataBits, st.parity, st.stopBits,
              st.dtr ? "true" : "false", st.rts ? "true" : "false", st.breakOn ? "true" : "false",
-             (unsigned)st.ignoredControls,
+             (unsigned)st.ignoredControls, (unsigned)st.hookRuns, (unsigned)st.hookFailures,
              st.quietMode ? "true" : "false", (unsigned)st.tcpPort, (unsigned)st.maintenanceRemainingMs);
     return String(buf);
 }

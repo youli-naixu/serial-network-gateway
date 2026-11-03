@@ -27,7 +27,8 @@ def package_portable(root: Path) -> Path:
         for path in sorted(app_dir.rglob("*")) if path.is_file() and path != manifest
     }
     manifest.write_text(json.dumps(checksums, indent=2) + "\n", encoding="utf-8")
-    archive = root / "dist" / "SerialGateway-0.1.0-windows-x64.zip"
+    version = (root / "serial_gateway" / "__init__.py").read_text(encoding="utf-8").split('__version__ = "', 1)[1].split('"', 1)[0]
+    archive = root / "dist" / f"ASR-Wireless-Flash-Assistant-{version}-windows-x64.zip"
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as output:
         for path in sorted(app_dir.rglob("*")):
             if path.is_file():

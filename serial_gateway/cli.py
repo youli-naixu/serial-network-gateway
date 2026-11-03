@@ -37,7 +37,9 @@ def build_parser(language: str = "zh-CN") -> argparse.ArgumentParser:
     parser.add_argument("--language", choices=("zh-CN", "en"), default=language, help=text("界面和命令行语言", "Interface and command-line language"))
     parser.add_argument("--config", help=text("配置文件路径；默认使用用户本地应用目录", "Profile file; defaults to the user application directory"))
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("gui", help=text("打开图形界面；不自动连接设备", "Open the desktop UI without connecting automatically"))
+    assistant = sub.add_parser("assistant", help=text("打开 ASR 无线烧录助手（默认）", "Open the ASR wireless flashing assistant (default)"))
+    assistant.add_argument("--minimized", action="store_true", help=text("启动后只显示托盘图标", "Start in the tray"))
+    sub.add_parser("gui", help=text("打开高级工具窗口；不自动连接设备", "Open the advanced tools window without connecting automatically"))
     sub.add_parser("profiles", help=text("列出配置档", "List saved profiles"))
     sub.add_parser("environment", help=text("只读检查 COM 和驱动，不打开串口", "Inspect COM/driver metadata without opening ports"))
     driver = sub.add_parser("driver-help", help=text("显示虚拟 COM 接入说明", "Show virtual COM integration instructions"))
@@ -108,6 +110,24 @@ def build_parser(language: str = "zh-CN") -> argparse.ArgumentParser:
     c0c.add_argument("--host", required=True)
     c0c.add_argument("--port", required=True, type=tcp_port)
     c0c.add_argument("--duration", type=float, default=0, help=text("运行秒数；0直到Ctrl+C", "Run time in seconds; 0 until Ctrl+C"))
+    c0c.add_argument("--wait-open", action="store_true", help=text("等应用打开 COM 后再连接（需要关闭检测）", "Connect only when the application opens the COM port (needs close detection)"))
+    c0c.add_argument("--repeat", action="store_true", help=text("会话结束后自动等待下一次（配合 --wait-open）", "After a session ends, wait for the next one (use with --wait-open)"))
+    c0c.add_argument("--enter-url", help=text("每次连接前 POST 的地址，例如让 ESP32 进入烧录模式", "URL to POST before each connection, e.g. to put the ESP32 into flashing mode"))
+    c0c.add_argument("--connect-retry", type=float, default=0, help=text("连接被拒绝时重试的秒数", "Seconds to keep retrying a refused connection"))
+    station = sub.add_parser("station", help=text("一键无线烧录：带备注的虚拟 COM → ESP32", "One-click wireless flashing: labelled virtual COM -> ESP32"))
+    ssub = station.add_subparsers(dest="station_command", required=True)
+    ssub.add_parser("status", help=text("显示设置和已准备的虚拟 COM", "Show settings and the prepared virtual COM"))
+    sconf = ssub.add_parser("config", help=text("修改并保存设置", "Change and save settings"), allow_abbrev=False)
+    sconf.add_argument("--label", help=text("虚拟 COM 备注名", "Virtual COM label"))
+    sconf.add_argument("--host", help=text("ESP32 地址", "ESP32 address"))
+    sconf.add_argument("--port", type=tcp_port, help=text("ESP32 RFC2217 端口", "ESP32 RFC2217 port"))
+    sconf.add_argument("--enter-url", help=text("进入烧录模式的地址；空字符串用 http://<host>/api/maintenance/enter?mode=isp", "Enter-flashing URL; empty uses http://<host>/api/maintenance/enter?mode=isp"))
+    sconf.add_argument("--token-env", help=text("令牌所在环境变量名", "Environment variable holding the token"))
+    sprep = ssub.add_parser("prepare", help=text("创建/改名虚拟 COM（一次管理员确认）", "Create or relabel the virtual COM (one administrator prompt)"), allow_abbrev=False)
+    sprep.add_argument("--com", type=com_name, help=text("想要的 COM 名，缺省自动分配", "Wanted COM name; automatic by default"))
+    sprep.add_argument("--yes", action="store_true", help=yes_help)
+    srun = ssub.add_parser("run", help=text("运行，直到 Ctrl+C", "Run until Ctrl+C"), allow_abbrev=False)
+    srun.add_argument("--duration", type=float, default=0, help=text("运行秒数；0直到Ctrl+C", "Run time in seconds; 0 until Ctrl+C"))
     device = sub.add_parser("device", help=text("只读检查 ESP32 网关设备", "Read-only checks of an ESP32 gateway device"))
     dsub = device.add_subparsers(dest="device_command", required=True)
     check = dsub.add_parser("check", help=text("检测 TCP、可选 RFC2217 探测、HTTP 状态", "Check TCP, optional RFC2217 probe, HTTP status"), allow_abbrev=False)
@@ -168,11 +188,86 @@ def _vcom(args: argparse.Namespace, language: str) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _station(args: argparse.Namespace, language: str) -> int:
+    from dataclasses import asdict
+    from . import asr_station, vcom
+    config = asr_station.load_config()
+    action = args.station_command
+    if action == "config":
+        for key in ("label", "host", "port", "enter_url", "token_env"):
+            value = getattr(args, key)
+            if value is not None:
+                setattr(config, key, value)
+        asr_station.save_config(config)
+        _emit(asdict(config))
+        return 0
+    backend = vcom.Com0comBackend()
+    if not backend.setupc:
+        raise RuntimeError("com0com is not installed.")
+    pairs = backend.pairs()
+    pair = asr_station.find_station_pair(pairs, config.label)
+    if action == "status":
+        _emit({"config": asdict(config), "port": pair, "pairs": pairs})
+        return 0
+    if action == "prepare":
+        if pair is not None and not args.com:
+            _emit({"ok": True, "already": True, "port": pair})
+            return 0
+        if not _require_yes(args, language):
+            return 2
+        reuse = asr_station.reusable_pair(pairs)
+        result = backend.label_port(reuse["pair"] if reuse else None, config.label, args.com or "")
+        _emit(result)
+        return 0 if result.get("ok") else 1
+    if pair is None:
+        raise RuntimeError("No labelled virtual COM yet; run 'station prepare --yes' first.")
+    station = asr_station.FlashStation(config, pair["endpoint"], pair["com"])
+    station.start()
+    print((f"Ready: choose {pair['com']} ({config.label}) in the flashing tool. Ctrl+C stops." if language == "en"
+           else f"已就绪：在烧录软件里选择 {pair['com']}（{config.label}）。Ctrl+C 停止。"), flush=True)
+    end = time.monotonic() + args.duration if args.duration else None
+    last = None
+    try:
+        while end is None or time.monotonic() < end:
+            snap = station.snapshot()
+            key = (snap["state"], snap["sessions"], snap["last_result"], snap["error"])
+            if key != last:
+                last = key
+                _emit({k: snap[k] for k in ("state", "com", "sessions", "last_result", "last_prepare", "error")})
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        station.stop()
+    return 0
+
+
 def _bridge(args: argparse.Namespace, language: str) -> int:
     from .c0c_bridge import Com0comBridge
     if not 0 <= args.duration <= 86400:
         raise ValueError("Run duration must be between 0 and 86400 seconds.")
-    bridge = Com0comBridge(args.endpoint.strip().upper(), args.host.strip(), args.port)
+    if args.repeat and not args.wait_open:
+        raise ValueError("--repeat requires --wait-open.")
+    before = None
+    if args.enter_url:
+        if not args.enter_url.startswith(("http://", "https://")):
+            raise ValueError("--enter-url must be an http(s) URL.")
+        import urllib.request
+
+        def before() -> None:
+            request = urllib.request.Request(args.enter_url, data=b"{}", method="POST",
+                                             headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = response.read(2048).decode("utf-8", "replace")
+            if response.status != 200 or '"ok":false' in body.replace(" ", ""):
+                raise RuntimeError(f"enter-url failed: HTTP {response.status}")
+
+    def make() -> "Com0comBridge":
+        return Com0comBridge(args.endpoint.strip().upper(), args.host.strip(), args.port,
+                             connect_on_app_open=args.wait_open, before_connect=before,
+                             connect_retry_s=max(0.0, args.connect_retry))
+
+    bridge = make()
     end = time.monotonic() + args.duration if args.duration else None
     last = None
     result = 0
@@ -185,6 +280,13 @@ def _bridge(args: argparse.Namespace, language: str) -> int:
                 last = key
                 _emit({k: snap.get(k) for k in ("state", "message", "endpoint", "remote", "session_id",
                                                 "app_to_device", "device_to_app", "settings", "lines", "last_error")})
+            if snap["state"] in ("needs_reset", "error") and args.repeat:
+                bridge.stop()
+                time.sleep(0.5)
+                bridge = make()
+                bridge.start()
+                last = None
+                continue
             if snap["state"] in ("needs_reset", "error"):
                 print("Bridge session ended; run the command again for a new session." if language == "en"
                       else "桥接会话已结束；重新运行本命令开始新会话。", flush=True)
@@ -289,8 +391,12 @@ def main(argv: list[str] | None = None) -> int:
     language = resolve_language(known.language)
     parser = build_parser(language)
     args = parser.parse_args(values)
-    command = args.command or "gui"
+    command = args.command or "assistant"
     try:
+        if command == "assistant":
+            from .assistant import main as assistant_main
+            assistant_main(start_minimized=getattr(args, "minimized", False))
+            return 0
         if command == "gui":
             from .gui import main as gui_main
             gui_main(args.config, language=args.language)
@@ -360,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
             return _bridge(args, language)
         if command == "device":
             return _device(args, language)
+        if command == "station":
+            return _station(args, language)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(("Error: " if language == "en" else "错误：") + translate_error(exc, language), file=sys.stderr)
         return 1
