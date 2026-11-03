@@ -63,6 +63,12 @@ class SingleInstance:
     def release(self) -> None:
         sock, self._sock = self._sock, None
         if sock is not None:
+            try:
+                # On Linux close() alone does not wake a thread blocked in accept(),
+                # which keeps the port bound.
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             sock.close()
 
 

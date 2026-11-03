@@ -1,0 +1,19 @@
+{
+  "name": "SerialNetworkGateway",
+  "version": "0.4.0",
+  "description": "On-demand RFC2217 serial-over-Wi-Fi maintenance mode for ESP32 firmware.",
+  "keywords": "rfc2217, serial, uart, wifi, bootloader",
+  "license": "Apache-2.0",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": [
+    { "name": "WiFi" }
+  ],
+  "build": {
+    "srcDir": "src",
+    "libLDFMode": "deep+"
+  },
+  "export": {
+    "exclude": ["ci", "examples/*/.pio"]
+  }
+}
